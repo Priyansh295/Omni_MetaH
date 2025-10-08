@@ -1,0 +1,13 @@
+torch
+pandas
+tqdm
+Pillow
+numpy
+torchvision
+kornia
+thop
+ptflops
+pytorch_wavelets
+matplotlib 
+optuna
+nevergrad

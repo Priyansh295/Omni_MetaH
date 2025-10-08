@@ -1,0 +1,28 @@
+# Ignore datasets & large files
+*.csv
+*.zip
+*.tar
+*.tar.gz
+*.npy
+*.npz
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.mp4
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+
+#code.zip
+#comparison.zip
+#datasetceleb.zip
+#filestructure.txt
