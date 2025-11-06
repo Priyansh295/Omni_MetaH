@@ -1,74 +1,209 @@
-# Blind_Omni_Wav_Net
+# Blind Omni Wav Net
 
-A PyTorch-based deep learning framework for image inpainting and restoration, featuring metaheuristic optimization (GA, PSO, DE, BO) for neural architecture and loss function search.
+Deep learning framework for blind image inpainting and restoration with an integrated metaheuristic optimizer (GA, PSO, DE, BO) that tunes architecture and training hyperparameters. The model combines transformer-style attention, omni-dimensional convolutions, and a wavelet-based self-supervised pathway for robust completion.
 
-## Features
+![Architecture](architecture.jpg)
 
-- **Image Inpainting** using a custom neural network architecture
-- **Metaheuristic Optimization**: Genetic Algorithm (GA), Particle Swarm Optimization (PSO), Differential Evolution (DE), and Bayesian Optimization (BO) for hyperparameters and architecture
-- **Progressive Training** and multi-loss (L1, perceptual, SSIM, edge)
-- **Evaluation Metrics**: PSNR, SSIM
+## Highlights
 
-## Installation
+- Transformer-based inpainting with multi-scale U-Net-like hierarchy.
+- Omni-Dimensional Convolution (`ODConv2d`) adapts kernels across channel/filter/spatial dimensions.
+- Wavelet SSL path (`DWT/IDWT`) enables frequency-aware representation learning.
+- Integrated metaheuristics: GA (architecture), PSO (loss weights), DE (expansion factor), BO (LR/batch size).
+- Progressive training with multi-loss: L1, Perceptual (VGG16), SSIM, Edge (Sobel).
+- Evaluation metrics and complexity analysis (PSNR/SSIM, THOP/PTFlops).
 
-1. Clone the repository:
-   ```sh
-   git clone https://github.com/YOUR_GITHUB_USERNAME/Blind_Omni_Wav_Net.git
-   cd Blind_Omni_Wav_Net
-   ```
-2. Install dependencies:
-   ```sh
-   pip install -r requirements.txt
-   ```
+## Architecture Overview
+
+- Core model: `Inpainting` in `model_directional_query_od.py`.
+- Blocks
+  - `MDTA`: multi-dilation transformer attention for long-range context.
+  - `GDFN`: gated-dilation feed-forward network for efficient channel mixing.
+  - `TransformerBlock`: residual attention + feed-forward fusion.
+  - `DownSample`/`UpSample`: multi-scale feature pyramid with skip connections.
+- Auxiliary modules
+  - `ODConv2d` (in `odconv.py`): generates channel, filter, spatial, and kernel attention weights; dynamically composes convolution kernels.
+  - Wavelet SSL (via `pytorch_wavelets`): `DWTForward`/`DWTInverse` for frequency-domain modeling.
+  - Losses: `OptimizedVGGPerceptualLoss`, SSIM/PSNR (stable double precision), edge loss via `kornia.sobel`.
+
+## Repository Structure
+
+- Top-level
+  - `main_py.py`: primary training + metaheuristics driver (robust, memory-optimized).
+  - `main.py`: legacy training/optimization entry point (still functional).
+  - `inference_inpaint.py`: batch inference with JSON-config loading.
+  - `test.py`: inference and performance analysis (metrics, THOP/PTFlops).
+  - `model_directional_query_od.py`: core `Inpainting` model and submodules.
+  - `odconv.py`: omni-dimensional convolution and attention generator.
+  - `utils_train.py`: args/config, dataset/augmentations, metrics, perceptual loss, performance monitors.
+  - `mask_generator.py`, `x.py`: comprehensive mask/composite generators (basic/composite/enhanced/demo).
+  - `datasets/`: dataset roots (e.g., `NewData`, `celeb`, `ffhq`, `paris`, `places`).
+  - `results/`: checkpoints, logs, metaheuristic results, visualizations, hyperparam plots.
+
+## Dependencies and Roles
+
+- `torch`, `torchvision`: model, training, IO utilities.
+- `numpy`, `Pillow`, `opencv-python` (via `cv2` used in `x.py`): image IO and processing.
+- `kornia`: edge filters (`sobel`) for edge loss.
+- `pytorch_wavelets`: `DWT/IDWT` for frequency-aware SSL.
+- `thop`, `ptflops`: complexity and FLOPs analysis.
+- `pandas`, `tqdm`: reporting and progress bars.
+- `matplotlib` (and optionally `seaborn`): result visualization; `seaborn` is imported in `main_py.py` (install as needed).
+- `optuna`, `nevergrad`: metaheuristic optimization framework.
+
+Install all with `pip install -r requirements.txt`. For GPU acceleration, install PyTorch with the correct CUDA build from the official instructions.
+
+## Setup
+
+- Requirements
+  - Python 3.9+ (tested with modern PyTorch)
+  - Optional CUDA GPU
+  - OS: Windows and Linux supported
+- Installation
+  ```sh
+  git clone https://github.com/YOUR_GITHUB_USERNAME/Blind_Omni_Wav_Net.git
+  cd Blind_Omni_Wav_Net
+  python -m venv .venv
+  .venv\Scripts\activate  # Windows
+  # Or: source .venv/bin/activate  # Linux/macOS
+  pip install -r requirements.txt
+  # Install PyTorch per CUDA/CPU from https://pytorch.org/get-started/locally/
+  ```
+
+## Dataset Preparation
+
+- Expected layout (example: `NewData`)
+  ```
+  datasets/NewData/
+    inp/      # corrupted/masked inputs
+    target/   # ground-truth targets
+  ```
+- Other provided datasets: `celeb`, `ffhq`, `paris`, `places` use similar `input`/`target` directory naming.
+- Mask generation (optional) via `x.py`:
+  ```sh
+  # Basic irregular masks
+  python x.py --mode basic --input_dir datasets/NewData/inp --output_dir datasets/NewData/inp --mask_type irregular
+
+  # Enhanced composite overlays (opaque), preserving faces
+  python x.py --mode enhanced --input_dir datasets/NewData/inp --output_dir datasets/NewData/inp \
+    --num_variations 2 --style high_coverage_splashes --preserve_face
+  ```
 
 ## Usage
 
-### Training
-
-To train the model with default settings:
+### Primary Training (memory-optimized defaults)
 
 ```sh
-python main.py --data_path ./datasets/celeb --data_path_test ./datasets/celeb --save_path ./results
+python main_py.py
 ```
 
-### Metaheuristic Optimization
+- Optimization flow
+  - `--optimize`: run GA+PSO+DE+BO to synthesize final params, then train.
+  - `--use-defaults`: train with the original defaults without metaheuristics.
+- Example
+  ```sh
+  # Run integrated metaheuristics then train
+  python main_py.py --optimize
 
-To run architecture and loss optimization:
+  # Use original defaults
+  python main_py.py --use-defaults
+  ```
+
+### Legacy Training Driver
 
 ```sh
 python main.py --optimize
+# Or
+python main.py
 ```
 
-### Arguments
+### Inference
 
-- `--data_path`: Path to training data
-- `--data_path_test`: Path to test data
-- `--save_path`: Directory to save results
-- `--optimize`: Run metaheuristic optimization
+```sh
+python inference_inpaint.py --input_dir ./test --output_dir ./results/visualizations
 
-## Project Structure
+# With a saved JSON config describing model params
+python inference_inpaint.py --input_dir ./test --output_dir ./results/visualizations \
+  --config_json ./results/metaheuristic_results/final_params.json
+```
 
-- `main.py`: Main training and optimization script
-- `model_directional_query_od.py`: Model architecture
-- `utils_train.py`: Utilities for training, metrics, and dataset
-- `datasets/`: Place your training and test images here
-- `results/`: Output and logs
+### Testing and Analysis
 
-## Optimization Details
+```sh
+python test.py --compute_metrics --compute_thop --compute_ptflops
+```
 
-- **GA**: Optimizes architecture (blocks, heads, channels, refinement)
-- **PSO**: Optimizes loss weights (L1, perceptual, SSIM, edge)
-- **DE**: Optimizes expansion factor
-- **BO**: Optimizes learning rate and batch size
+### Mask Generation (artistic/composite)
 
-## Citing
+```sh
+python x.py --mode composite --input_dir ./datasets/NewData/inp --output_dir ./datasets/NewData/inp \
+  --style mixed_artistic --num_variations 1
 
-If you use this code, please cite the repository and relevant papers.
+python x.py --mode enhanced --input_dir ./datasets/NewData/inp --output_dir ./datasets/NewData/inp \
+  --num_variations 2 --style high_coverage_splashes --preserve_face
+```
+
+## Configuration and CLI Notes
+
+- Training args are defined in `utils_train.parse_args` and include:
+  - Architecture: `num_blocks`, `num_heads`, `channels`, `num_refinement`, `expansion_factor`
+  - Training: `num_iter`, `batch_size`, `lr`, `milestone`, `patch_size`
+  - Paths: `data_path`, `data_path_test`, `save_path`
+  - Augmentations and performance toggles
+- Inference can load model configs from a JSON file via `--config_json`.
+- Environment tuning (CUDA): set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
+- Reproducibility: seeds and directories initialized in `utils_train.init_args`.
+
+## Metaheuristic Optimization
+
+- Manager: `OptimizedMetaheuristicManager` in `main_py.py`.
+- Algorithms
+  - GA: selects `num_blocks`, `num_heads`, `channels`, `num_refinement` from compact, memory-safe sets.
+  - PSO: tunes loss weights `(w_l1, w_percep, w_ssim, w_edge)`.
+  - DE: tunes `expansion_factor`.
+  - BO: tunes `lr` (and batch size in legacy flow).
+- Budgets are reduced for stability on larger datasets (see constants in `main_py.py`).
+- Results and plots are saved under `results/metaheuristic_results` and `results/hyperparam_plots`.
+
+## Results and Outputs
+
+- Checkpoints: `results/checkpoints` and `results/inpaint.txt`.
+- Metaheuristic artifacts: `results/metaheuristic_results`.
+- Logs: `results/logs`.
+- Visualizations: `results/visualizations`.
+- Hyperparameter plots: `results/hyperparam_plots/params_lr_vs_objective.png`.
+
+## Troubleshooting
+
+- Mixed precision is disabled by default (`USE_MIXED_PRECISION = False`) due to stability; training runs in FP32.
+- If you encounter CUDA OOM, reduce `batch_size`, use smaller `num_blocks/channels`, or enable `PYTORCH_CUDA_ALLOC_CONF`.
+- Ensure `seaborn` is installed if using `main_py.py` visualizations.
+- `pytorch_wavelets` may require specific PyTorch/CUDA builds; consult upstream docs.
+
+## Changelog
+
+- 0.4.1
+  - Documentation: comprehensive README with architecture, setup, usage, dependencies, and changelog.
+- 0.4.0
+  - Integrated metaheuristics manager (`main_py.py`) with GA+PSO+DE+BO and memory-optimized training.
+- 0.3.2
+  - Inference pipeline improvements (`inference_inpaint.py`): robust IO, JSON config loading.
+- 0.3.0
+  - Enhanced mask generation (`x.py`): composite/enhanced modes, face preservation, opaque overlays.
+- 0.2.0
+  - ODConv2d integration (`odconv.py`) and transformer attention blocks; multi-loss training.
+- 0.1.0
+  - Initial training loop, dataset, and basic utilities.
 
 ## Contributing
 
-Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
+- Pull requests welcome. Please include clear descriptions and focused changes.
+- For larger features, open an issue to discuss design and integration.
+
+## Citation
+
+If you use this repository in academic work, please cite the project and relevant upstream papers (ODConv, transformer attention, wavelet SSL).
 
 ## License
 
-[MIT](LICENSE)
+No license file is included. Please add a `LICENSE` file (MIT recommended) to specify terms.
