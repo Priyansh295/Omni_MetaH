@@ -44,6 +44,7 @@ Deep learning framework for blind image inpainting and restoration with an integ
 
 - `torch`, `torchvision`: model, training, IO utilities.
 - `numpy`, `Pillow`, `opencv-python` (via `cv2` used in `x.py`): image IO and processing.
+- `scipy` (optional but recommended): Gaussian blur utilities and Voronoi ops used by mask/composite generators.
 - `kornia`: edge filters (`sobel`) for edge loss.
 - `pytorch_wavelets`: `DWT/IDWT` for frequency-aware SSL.
 - `thop`, `ptflops`: complexity and FLOPs analysis.
@@ -143,6 +144,47 @@ python x.py --mode enhanced --input_dir ./datasets/NewData/inp --output_dir ./da
   --num_variations 2 --style high_coverage_splashes --preserve_face
 ```
 
+### Organic Patch-Based Compositing (advanced)
+
+Use `organic_patch_composite.py` to create highly realistic, organic patch masks that paste regions from a donor image into the base image, with soft, multi-scale blending. Outputs `input/` (composite) and `target/` (binary mask), plus a `donor/` note.
+
+Pipelines:
+- `fbm_poisson`: fractal noise (FBM) + domain warp → Poisson color harmonization.
+- `voronoi_laplacian`: warped Voronoi regions → Laplacian pyramid blend.
+- `flow_laplacian`: curl-noise streamlines (scribbles) → Laplacian blend.
+- `vae_masks` (optional): tiny VAE samples mask shapes → Laplacian blend.
+
+Examples:
+```sh
+# FBM + Poisson (recommended default)
+python organic_patch_composite.py \
+  --input_images_dir ./datasets/ffhq/input \
+  --overlay_images_dir ./datasets/ffhq/input \
+  --output_dir ./datasets/OrganicMaskOut \
+  --pipeline fbm_poisson --per_image 4
+
+# Voronoi + Laplacian
+python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
+  --output_dir ./datasets/OrganicMaskOut --pipeline voronoi_laplacian
+
+# Flow + Laplacian (scribble occlusions)
+python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
+  --output_dir ./datasets/OrganicMaskOut --pipeline flow_laplacian
+
+# VAE masks (optional; trains a tiny VAE quickly)
+python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
+  --output_dir ./datasets/OrganicMaskOut --pipeline vae_masks --use_vae
+
+# Force CPU (deterministic CPU path)
+python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
+  --output_dir ./datasets/OrganicMaskOut --pipeline fbm_poisson --cpu_only
+```
+
+Colab tips:
+- Enable GPU runtime; the script auto-detects CUDA and accelerates noise/blur + VAE.
+- If `scipy` is missing: `pip install -q scipy`.
+- Save to Drive paths for large runs.
+
 ## Configuration and CLI Notes
 
 - Training args are defined in `utils_train.parse_args` and include:
@@ -181,6 +223,13 @@ python x.py --mode enhanced --input_dir ./datasets/NewData/inp --output_dir ./da
 - `pytorch_wavelets` may require specific PyTorch/CUDA builds; consult upstream docs.
 
 ## Changelog
+
+- 0.5.0
+  - New advanced compositing script `organic_patch_composite.py` with pipelines: `fbm_poisson`, `voronoi_laplacian`, `flow_laplacian`, and optional `vae_masks`.
+  - Blending utilities: soft alpha (`smoothstep`), Laplacian pyramid blending, Poisson color harmonization.
+  - Dataset runner CLI for large-scale generation; saves `input/`, `target/`, and donor references.
+  - GPU/CPU fallback using PyTorch for noise/blur operations; `--cpu_only` flag.
+  - Updated `scribble_mask_flow.py`: added GPU acceleration and `collage_overlay` style with `--overlay_images_dir`.
 
 - 0.4.1
   - Documentation: comprehensive README with architecture, setup, usage, dependencies, and changelog.
