@@ -1,12 +1,12 @@
-# Omni MetaH: Blind Inpainting with Omni-dimensional Gated Attention and Wavelet Queries
-
-![Architecture](image.png)
+# WaveMamba: Wavelet-Guided Selective State Space
+Models for Blind Image Inpainting![Architecture](image.png)
 
 ## 📌 Overview
 
-**Omni MetaH** (also referred to as *Blind Omni Wav Net*) is a state-of-the-art framework for **blind image inpainting**—the task of restoring corrupted images without a known mask. 
+**Omni MetaH** (also referred to as *Blind Omni Wav Net*) is a state-of-the-art framework for **blind image inpainting**—the task of restoring corrupted images without a known mask.
 
 This project introduces a novel architecture that combines:
+
 - **Wavelet-Guided Selective State Space Models (WG-SSM):** Leveraging the O(N) efficiency of Mamba/SSMs while injecting frequency-domain guidance (Wavelets) to modulate state transitions.
 - **Omni-dimensional Gated Attention:** Using `ODConv` (Omni-dimensional Convolution) for dynamic, multi-dimensional feature attention.
 - **Wavelet Queries:** Preserving high-frequency details akin to Transformers but with far greater efficiency.
@@ -22,22 +22,25 @@ This project introduces a novel architecture that combines:
 ## 🛠️ Installation
 
 1. **Clone the repository:**
+
    ```bash
    git clone https://github.com/Priyansh295/Omni_MetaH.git
    cd Omni_MetaH
    ```
-
 2. **Install dependencies:**
    It is recommended to use a Conda environment.
+
    ```bash
    pip install -r requirements.txt
    ```
 
    **Note on Mamba:**
    To enable the optimized Mamba backbone, you need `mamba-ssm`. This requires CUDA.
+
    ```bash
    pip install mamba-ssm
    ```
+
    *If `mamba-ssm` is not found, the model falls back to a pure PyTorch implementation (`PureSSM` or `WaveletGuidedSSM`), which is slower but compatible with all GPUs/CPUs.*
 
 ## 🚀 Usage
@@ -55,6 +58,7 @@ python inference_inpaint.py \
 ```
 
 **Common Arguments:**
+
 - `--model_path`: Path to the `.pth` checkpoint.
 - `--input_dir`: Folder containing images to process.
 - `--image_size`: (Optional) Resize images before processing (e.g., `--image_size 256`).
@@ -75,6 +79,7 @@ python main_py.py \
 
 **Metaheuristic Optimization:**
 The training script (`main_py.py`) can automatically optimize hyperparameters. The `run_improved_optimization` function triggers GA/PSO/DE search strategies to find the best:
+
 - `num_blocks`, `num_heads`, `channels`
 - `learning_rate`, `loss_weights`
 - `expansion_factor`
