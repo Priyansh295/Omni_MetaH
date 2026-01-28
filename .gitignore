@@ -51,3 +51,16 @@ paper/
 wave-mamba/
 ICML2026StyleSheet/
 DataSetFiles/
+evaluation/
+checkpoints/
+
+copyOfMain.py
+evaluate_metrics.py
+generate_ablation_plot.py
+main.py
+organic_patch_composite.py
+reviewers_questions.md
+run_inference.py
+test_pipeline.py
+test.py
+wavelet_guided_ssm.md
