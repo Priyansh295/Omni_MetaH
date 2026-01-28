@@ -1,6 +1,6 @@
 # WaveMamba: Wavelet-Guided Selective State Space Models for Blind Image Inpainting
 
-![Architecture](architecture.png)
+![Architecture](architecture.svg)
 
 
 ## 📌 Overview
