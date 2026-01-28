@@ -46,6 +46,14 @@ class OptimizedConfig(object):
         self.model_file = args.model_file
         self.finetune = args.finetune
         
+        # Validation and early stopping
+        self.val_every = getattr(args, 'val_every', 500)
+        self.early_stop = getattr(args, 'early_stop', True)
+        self.target_psnr = getattr(args, 'target_psnr', 30.0)
+        self.target_ssim = getattr(args, 'target_ssim', 0.9)
+        self.early_stop_patience = getattr(args, 'early_stop_patience', 3)
+        self.min_delta = getattr(args, 'min_delta', 0.001)
+        
         # Optimization parameters
         self.mixed_precision = getattr(args, 'mixed_precision', True)
         self.gradient_clip = getattr(args, 'gradient_clip', 1.0)
@@ -93,8 +101,8 @@ def parse_args():
     # Training parameters
     parser.add_argument('--num_iter', type=int, default=9057800, 
                        help='Iterations of training')
-    parser.add_argument('--batch_size', nargs='+', type=int, default=[2, 2, 2, 2, 2, 2],
-                       help='Batch size for progressive learning')
+    parser.add_argument('--batch_size', nargs='+', type=int, default=[8, 8, 8, 8, 8, 8],
+                       help='Batch size for progressive learning (default 8 for A40/48GB)')
     parser.add_argument('--patch_size', nargs='+', type=int, default=[128, 160, 192, 256, 320, 384],
                        help='Patch size for progressive learning')
     parser.add_argument('--lr', type=float, default=0.00003, 
@@ -109,6 +117,20 @@ def parse_args():
                        help='Path of pre-trained model file')
     parser.add_argument('--finetune', default=True, 
                        help='Enable fine-tuning')
+
+    # Validation cadence and early stopping
+    parser.add_argument('--val_every', type=int, default=500,
+                       help='Validate and checkpoint every N iterations')
+    parser.add_argument('--early_stop', type=bool, default=True,
+                       help='Enable metric-based early stopping')
+    parser.add_argument('--target_psnr', type=float, default=30.0,
+                       help='Stop when validation PSNR reaches this threshold')
+    parser.add_argument('--target_ssim', type=float, default=0.9,
+                       help='Stop when validation SSIM reaches this threshold')
+    parser.add_argument('--early_stop_patience', type=int, default=3,
+                       help='Stop after this many validations without improvement')
+    parser.add_argument('--min_delta', type=float, default=0.001,
+                       help='Minimum improvement to reset patience')
     
     # Optimization parameters
     parser.add_argument('--mixed_precision', type=bool, default=True,
@@ -227,13 +249,13 @@ class AdvancedAugmentation:
             return erasing(img)
         return img
 
-
 class OptimizedTrainDataset(Dataset):
     """Enhanced training dataset with optimizations and advanced augmentation"""
     
     def __init__(self, data_path: str, data_path_test: str, data_name: str, 
                  data_type: str, patch_size: Optional[int] = None, 
-                 length: Optional[int] = None, use_advanced_aug: bool = True):
+                 length: Optional[int] = None, use_advanced_aug: bool = True,
+                 inp_files: Optional[List[str]] = None, target_files: Optional[List[str]] = None):
         super().__init__()
         
         self.data_name = data_name
@@ -245,8 +267,17 @@ class OptimizedTrainDataset(Dataset):
         self.augmentation = AdvancedAugmentation(probability=0.5) if use_advanced_aug else None
         
         # Enhanced file discovery with multiple extensions and error handling
-        self.corrupt_images, self.clear_images = self._discover_images(data_path)
-        self.corrupt_images_test, self.clear_images_test = self._discover_images(data_path_test)
+        if inp_files is not None and target_files is not None:
+            # Use provided file lists (e.g. from train/val split)
+            # FIX: Always put provided files in primary dataset for both train and val
+            self.corrupt_images = inp_files
+            self.clear_images = target_files
+            self.corrupt_images_test = []
+            self.clear_images_test = []
+        else:
+            # Discover files from directories
+            self.corrupt_images, self.clear_images = self._discover_images(data_path)
+            self.corrupt_images_test, self.clear_images_test = self._discover_images(data_path_test)
         
         # Validate discovered images
         self._validate_image_pairs()
@@ -267,25 +298,34 @@ class OptimizedTrainDataset(Dataset):
         """Enhanced image discovery with multiple formats and fallback paths"""
         
         file_extensions = ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG', '*.bmp', '*.tiff']
-        folder_variants = ['inp', 'input', 'corrupted', 'masked']
-        target_folders = ['target', 'gt', 'clean', 'original']
         
+        # Initialize lists to avoid NameError
         corrupt_images = []
         clear_images = []
         
-        # Try different folder variants for input images
-        for folder in folder_variants:
+        # Custom logic for user's specific dataset structure:
+        # User confirmed: 'input' folder contains GROUND TRUTH (clear)
+        # User confirmed: 'target' folder contains MASKED IMAGE (corrupt)
+        
+        # 1. Find Corrupt Images (Source: 'target', 'masked', etc.)
+        # Priority: target -> masked -> corrupted
+        corrupt_folders = ['target', 'masked', 'corrupted', 'inp'] 
+        for folder in corrupt_folders:
             folder_path = os.path.join(data_path, folder)
             if os.path.exists(folder_path):
+                print(f"  [Dataset] Found corrupt/masked images in: {folder}")
                 for ext in file_extensions:
                     corrupt_images.extend(glob.glob(os.path.join(folder_path, ext)))
                 if corrupt_images:
                     break
-        
-        # Try different folder variants for target images
-        for folder in target_folders:
+
+        # 2. Find Clear Images (Source: 'input', 'gt', etc.)
+        # Priority: input -> gt -> clean -> original
+        clear_folders = ['input', 'gt', 'clean', 'original', 'target'] # Added target at end just in case but input is prio
+        for folder in clear_folders:
             folder_path = os.path.join(data_path, folder)
             if os.path.exists(folder_path):
+                print(f"  [Dataset] Found ground truth/clear images in: {folder}")
                 for ext in file_extensions:
                     clear_images.extend(glob.glob(os.path.join(folder_path, ext)))
                 if clear_images:
@@ -371,12 +411,22 @@ class OptimizedTrainDataset(Dataset):
         """Enhanced getitem with optimized loading and error handling"""
         
         try:
-            if self.data_type == 'train':
-                # Training data
+            # Determine which list to use
+            # If we explicitly provided files (which populates corrupt_images but not corrupt_images_test),
+            # or if we are in train mode, use the primary list.
+            # Only use test list if we are NOT in train mode AND we have test images discovered.
+            use_test_list = (self.data_type != 'train') and (self.num_test > 0)
+            
+            if not use_test_list:
+                # Training data OR Validation data provided as explicit files
+                if self.num == 0:
+                    raise IndexError(f"Primary dataset is empty (data_type={self.data_type})")
                 corrupt_image_path = self.corrupt_images[idx % self.num]
                 clear_image_path = self.clear_images[idx % self.num]
             else:
-                # Test data
+                # Test data from separated test directory
+                if self.num_test == 0:
+                     raise IndexError(f"Test dataset is empty (data_type={self.data_type})")
                 corrupt_image_path = self.corrupt_images_test[idx % self.num_test]
                 clear_image_path = self.clear_images_test[idx % self.num_test]
             

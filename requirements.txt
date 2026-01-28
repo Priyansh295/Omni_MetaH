@@ -11,3 +11,7 @@ pytorch_wavelets
 matplotlib 
 optuna
 nevergrad
+seaborn
+torchmetrics
+pytorch-fid
+scikit-image

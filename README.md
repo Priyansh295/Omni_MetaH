@@ -1,258 +1,169 @@
-# Blind Omni Wav Net
+# Blind_Omni_Wav_Net
 
-Deep learning framework for blind image inpainting and restoration with an integrated metaheuristic optimizer (GA, PSO, DE, BO) that tunes architecture and training hyperparameters. The model combines transformer-style attention, omni-dimensional convolutions, and a wavelet-based self-supervised pathway for robust completion.
+Blind_Omni_Wav_Net is a PyTorch-based image inpainting and restoration system with a transformer-style encoder-decoder backbone and dynamic convolution (ODConv2d). It includes metaheuristic optimization (GA, PSO, DE, BO) for architecture and loss weighting, progressive training, and robust validation with PSNR/SSIM.
 
-![Architecture](architecture.jpg)
+## Overview
 
-## Highlights
+- Purpose: Restore occluded or corrupted regions using a learned inpainting model.
+- Core: `Inpainting` network with multi-head attention, gated feed-forward, multi-scale feature aggregation.
+- Optimization: Integrated GA/PSO/DE/BO to search architecture, hyperparameters, and loss weights.
+- Validation: Periodic evaluation every `100` iterations in `main_py.py`, saving the best model on metric improvements.
 
-- Transformer-based inpainting with multi-scale U-Net-like hierarchy.
-- Omni-Dimensional Convolution (`ODConv2d`) adapts kernels across channel/filter/spatial dimensions.
-- Wavelet SSL path (`DWT/IDWT`) enables frequency-aware representation learning.
-- Integrated metaheuristics: GA (architecture), PSO (loss weights), DE (expansion factor), BO (LR/batch size).
-- Progressive training with multi-loss: L1, Perceptual (VGG16), SSIM, Edge (Sobel).
-- Evaluation metrics and complexity analysis (PSNR/SSIM, THOP/PTFlops).
+## Architecture Diagram
 
-## Architecture Overview
+![Model Architecture](architecture.jpg)
 
-- Core model: `Inpainting` in `model_directional_query_od.py`.
-- Blocks
-  - `MDTA`: multi-dilation transformer attention for long-range context.
-  - `GDFN`: gated-dilation feed-forward network for efficient channel mixing.
-  - `TransformerBlock`: residual attention + feed-forward fusion.
-  - `DownSample`/`UpSample`: multi-scale feature pyramid with skip connections.
-- Auxiliary modules
-  - `ODConv2d` (in `odconv.py`): generates channel, filter, spatial, and kernel attention weights; dynamically composes convolution kernels.
-  - Wavelet SSL (via `pytorch_wavelets`): `DWTForward`/`DWTInverse` for frequency-domain modeling.
-  - Losses: `OptimizedVGGPerceptualLoss`, SSIM/PSNR (stable double precision), edge loss via `kornia.sobel`.
+## System Architecture
 
-## Repository Structure
+- `model_directional_query_od.py`
+  - `ODConv2d`: Dynamic convolution with attention across channel/filter/spatial/kernel dimensions.
+  - Blocks: `MDTA` (attention), `GDFN` (feed-forward), `TransformerBlock` composed of MDTA+GDFN.
+  - Pyramids: `DownSample` and `UpSample` for multi-scale processing.
+  - `Inpainting`: U-shaped encoder-decoder using the above components; outputs restored image.
 
-- Top-level
-  - `main_py.py`: primary training + metaheuristics driver (robust, memory-optimized).
-  - `main.py`: legacy training/optimization entry point (still functional).
-  - `inference_inpaint.py`: batch inference with JSON-config loading.
-  - `test.py`: inference and performance analysis (metrics, THOP/PTFlops).
-  - `model_directional_query_od.py`: core `Inpainting` model and submodules.
-  - `odconv.py`: omni-dimensional convolution and attention generator.
-  - `utils_train.py`: args/config, dataset/augmentations, metrics, perceptual loss, performance monitors.
-  - `mask_generator.py`, `x.py`: comprehensive mask/composite generators (basic/composite/enhanced/demo).
-  - `datasets/`: dataset roots (e.g., `NewData`, `celeb`, `ffhq`, `paris`, `places`).
-  - `results/`: checkpoints, logs, metaheuristic results, visualizations, hyperparam plots.
+- `main_py.py` (memory-optimized training)
+  - Training: Progressive learning stages using varying `patch_size` and `batch_size` across milestones.
+  - Losses: L1, perceptual (VGG-based), SSIM, edge Sobel; weighted and combined.
+  - Validation: `save_loop` runs every `100` iterations; records PSNR/SSIM, saves CSV, persists best weights.
+  - Early stopping: Threshold-based (PSNR/SSIM) and patience-based with `min_delta`.
+  - Metaheuristics: `OptimizedMetaheuristicManager` orchestrates GA, PSO, DE, and BO with reduced budgets for stability.
 
-## Dependencies and Roles
+- `main.py` (simpler training/optimization script)
+  - Similar training loop with `val_every` configurable via CLI (default parsed as `500`).
+  - Fallback frequency uses `100` in-code but CLI parsing provides the value.
 
-- `torch`, `torchvision`: model, training, IO utilities.
-- `numpy`, `Pillow`, `opencv-python` (via `cv2` used in `x.py`): image IO and processing.
-- `scipy` (optional but recommended): Gaussian blur utilities and Voronoi ops used by mask/composite generators.
-- `kornia`: edge filters (`sobel`) for edge loss.
-- `pytorch_wavelets`: `DWT/IDWT` for frequency-aware SSL.
-- `thop`, `ptflops`: complexity and FLOPs analysis.
-- `pandas`, `tqdm`: reporting and progress bars.
-- `matplotlib` (and optionally `seaborn`): result visualization; `seaborn` is imported in `main_py.py` (install as needed).
-- `optuna`, `nevergrad`: metaheuristic optimization framework.
+- `utils_train.py`
+  - `parse_args` and `OptimizedConfig`: CLI parsing and default configuration values (data paths, iteration counts, milestones, early stopping).
+  - Dataset: `OptimizedTrainDataset` (and `TrainDataset`) with augmentation and length control for progressive stages.
+  - Metrics: `rgb_to_y`, `psnr`, `ssim` consistent with luminance evaluation.
+  - Loss: `OptimizedVGGPerceptualLoss` wrapper for perceptual features.
+  - Monitoring: `PerformanceMonitor`, `MemoryMonitor` utility classes.
 
-Install all with `pip install -r requirements.txt`. For GPU acceleration, install PyTorch with the correct CUDA build from the official instructions.
+- `test.py`
+  - Inference: `optimized_test_loop` computes PSNR/SSIM on test sets; periodic memory cleanup every 10 batches.
+  - Reporting: Saves restored images and comparison visuals.
 
-## Setup
+## Data Flow & Execution Flow
 
-- Requirements
-  - Python 3.9+ (tested with modern PyTorch)
-  - Optional CUDA GPU
-  - OS: Windows and Linux supported
-- Installation
-  ```sh
-  git clone https://github.com/YOUR_GITHUB_USERNAME/Blind_Omni_Wav_Net.git
-  cd Blind_Omni_Wav_Net
-  python -m venv .venv
-  .venv\Scripts\activate  # Windows
-  # Or: source .venv/bin/activate  # Linux/macOS
-  pip install -r requirements.txt
-  # Install PyTorch per CUDA/CPU from https://pytorch.org/get-started/locally/
-  ```
+1. CLI parse
+   - `main_py.py` uses a small argument pre-parser for `--optimize` or `--use-defaults`, then defers to `utils_train.parse_args` for full configuration.
 
-## Dataset Preparation
+2. Model & optimizer
+   - Build `Inpainting` with architecture from args (or optimized defaults).
+   - Optimizer: `AdamW` with `CosineAnnealingLR` over `args.num_iter`.
 
-- Expected layout (example: `NewData`)
-  ```
-  datasets/NewData/
-    inp/      # corrupted/masked inputs
-    target/   # ground-truth targets
-  ```
-- Other provided datasets: `celeb`, `ffhq`, `paris`, `places` use similar `input`/`target` directory naming.
-- Mask generation (optional) via `x.py`:
-  ```sh
-  # Basic irregular masks
-  python x.py --mode basic --input_dir datasets/NewData/inp --output_dir datasets/NewData/inp --mask_type irregular
+3. Progressive training
+   - On each milestone, rebuild `TrainDataset` with new `patch_size` and `batch_size`.
+   - Training steps compute multi-loss (L1, perceptual, SSIM, edge), backpropagate in FP32, gradient clip, and step.
 
-  # Enhanced composite overlays (opaque), preserving faces
-  python x.py --mode enhanced --input_dir datasets/NewData/inp --output_dir datasets/NewData/inp \
-    --num_variations 2 --style high_coverage_splashes --preserve_face
-  ```
+4. Validation & saving
+   - Every `100` iterations in `main_py.py`, `save_loop` runs:
+     - Calls `test_loop`, averages PSNR/SSIM over test loader.
+     - Appends to `results` and writes `{save_path}/{data_name}.csv`.
+     - If both PSNR and SSIM improve over best, writes best metrics to `{save_path}/{data_name}.txt` and saves `{save_path}/{data_name}.pth`.
+   - Early stopping checks thresholds and patience.
+
+5. Metaheuristic optimization (optional)
+   - `run_enhanced_metaheuristic_optimization` integrates GA/PSO/DE/BO and returns final parameters.
+   - Training then runs with the optimized parameters.
+
+## Validation Process
+
+- Frequency: Fixed at `100` iterations in `main_py.py`.
+- Metrics: PSNR and SSIM computed on Y (luminance) channel.
+- Best model: Saved only when both PSNR and SSIM improve vs. previous best.
+- Early stopping:
+  - Threshold mode: stop if PSNR ≥ `target_psnr` and SSIM ≥ `target_ssim`.
+  - Patience mode: stop after `early_stop_patience` validations without improvement by `min_delta`.
+
+## Dependencies
+
+- Python `>=3.8`
+- PyTorch `>=1.12`
+- torchvision
+- kornia
+- numpy, pandas, tqdm, seaborn, matplotlib
+- pillow, opencv-python
+- optuna, nevergrad
+
+Install all via:
+
+```sh
+pip install -r requirements.txt
+```
+
+If you don’t have a `requirements.txt`, install core packages:
+
+```sh
+pip install torch torchvision kornia numpy pandas tqdm seaborn matplotlib pillow opencv-python optuna nevergrad
+```
+
+## Installation
+
+```sh
+git clone https://github.com/YOUR_GITHUB_USERNAME/Blind_Omni_Wav_Net.git
+cd Blind_Omni_Wav_Net
+pip install -r requirements.txt
+```
 
 ## Usage
 
-### Primary Training (memory-optimized defaults)
+### Train (memory-optimized)
 
 ```sh
-python main_py.py
+python main_py.py --use-defaults --data_path ./datasets/celeb --data_path_test ./datasets/celeb --save_path ./results
 ```
 
-- Optimization flow
-  - `--optimize`: run GA+PSO+DE+BO to synthesize final params, then train.
-  - `--use-defaults`: train with the original defaults without metaheuristics.
-- Example
-  ```sh
-  # Run integrated metaheuristics then train
-  python main_py.py --optimize
-
-  # Use original defaults
-  python main_py.py --use-defaults
-  ```
-
-### Legacy Training Driver
+### Train (with metaheuristic optimization)
 
 ```sh
-python main.py --optimize
-# Or
-python main.py
+python main_py.py --optimize --data_path ./datasets/celeb --data_path_test ./datasets/celeb --save_path ./results
 ```
 
-### Inference
+### Inference / Testing
 
 ```sh
-python inference_inpaint.py --input_dir ./test --output_dir ./results/visualizations
-
-# With a saved JSON config describing model params
-python inference_inpaint.py --input_dir ./test --output_dir ./results/visualizations \
-  --config_json ./results/metaheuristic_results/final_params.json
+python test.py --data_path_test ./datasets/celeb --save_path ./results
 ```
 
-### Testing and Analysis
+### Key Arguments
 
-```sh
-python test.py --compute_metrics --compute_thop --compute_ptflops
-```
+- `--data_path`: Training images directory
+- `--data_path_test`: Test images directory
+- `--save_path`: Output directory for metrics, images, and weights
+- `--num_iter`: Total training iterations
+- `--milestone`: Iteration boundaries for progressive training
+- `--patch_size`: Patch sizes per stage
+- `--batch_size`: Batch sizes per stage
+- `--early_stop`, `--target_psnr`, `--target_ssim`, `--early_stop_patience`, `--min_delta`: Validation and stopping controls
+- `--val_every` (main.py): Validation cadence (default parsed as `500`). Note: `main_py.py` uses a fixed cadence of `100`.
+- `--model_file`: Resume from a saved weight file for evaluation only
 
-### Mask Generation (artistic/composite)
+## Project Structure
 
-```sh
-python x.py --mode composite --input_dir ./datasets/NewData/inp --output_dir ./datasets/NewData/inp \
-  --style mixed_artistic --num_variations 1
-
-python x.py --mode enhanced --input_dir ./datasets/NewData/inp --output_dir ./datasets/NewData/inp \
-  --num_variations 2 --style high_coverage_splashes --preserve_face
-```
-
-### Organic Patch-Based Compositing (advanced)
-
-Use `organic_patch_composite.py` to create highly realistic, organic patch masks that paste regions from a donor image into the base image, with soft, multi-scale blending. Outputs `input/` (composite) and `target/` (binary mask), plus a `donor/` note.
-
-Pipelines:
-- `fbm_poisson`: fractal noise (FBM) + domain warp → Poisson color harmonization.
-- `voronoi_laplacian`: warped Voronoi regions → Laplacian pyramid blend.
-- `flow_laplacian`: curl-noise streamlines (scribbles) → Laplacian blend.
-- `vae_masks` (optional): tiny VAE samples mask shapes → Laplacian blend.
-
-Examples:
-```sh
-# FBM + Poisson (recommended default)
-python organic_patch_composite.py \
-  --input_images_dir ./datasets/ffhq/input \
-  --overlay_images_dir ./datasets/ffhq/input \
-  --output_dir ./datasets/OrganicMaskOut \
-  --pipeline fbm_poisson --per_image 4
-
-# Voronoi + Laplacian
-python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
-  --output_dir ./datasets/OrganicMaskOut --pipeline voronoi_laplacian
-
-# Flow + Laplacian (scribble occlusions)
-python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
-  --output_dir ./datasets/OrganicMaskOut --pipeline flow_laplacian
-
-# VAE masks (optional; trains a tiny VAE quickly)
-python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
-  --output_dir ./datasets/OrganicMaskOut --pipeline vae_masks --use_vae
-
-# Force CPU (deterministic CPU path)
-python organic_patch_composite.py --input_images_dir ./datasets/ffhq/input \
-  --output_dir ./datasets/OrganicMaskOut --pipeline fbm_poisson --cpu_only
-```
-
-Colab tips:
-- Enable GPU runtime; the script auto-detects CUDA and accelerates noise/blur + VAE.
-- If `scipy` is missing: `pip install -q scipy`.
-- Save to Drive paths for large runs.
-
-## Configuration and CLI Notes
-
-- Training args are defined in `utils_train.parse_args` and include:
-  - Architecture: `num_blocks`, `num_heads`, `channels`, `num_refinement`, `expansion_factor`
-  - Training: `num_iter`, `batch_size`, `lr`, `milestone`, `patch_size`
-  - Paths: `data_path`, `data_path_test`, `save_path`
-  - Augmentations and performance toggles
-- Inference can load model configs from a JSON file via `--config_json`.
-- Environment tuning (CUDA): set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
-- Reproducibility: seeds and directories initialized in `utils_train.init_args`.
-
-## Metaheuristic Optimization
-
-- Manager: `OptimizedMetaheuristicManager` in `main_py.py`.
-- Algorithms
-  - GA: selects `num_blocks`, `num_heads`, `channels`, `num_refinement` from compact, memory-safe sets.
-  - PSO: tunes loss weights `(w_l1, w_percep, w_ssim, w_edge)`.
-  - DE: tunes `expansion_factor`.
-  - BO: tunes `lr` (and batch size in legacy flow).
-- Budgets are reduced for stability on larger datasets (see constants in `main_py.py`).
-- Results and plots are saved under `results/metaheuristic_results` and `results/hyperparam_plots`.
-
-## Results and Outputs
-
-- Checkpoints: `results/checkpoints` and `results/inpaint.txt`.
-- Metaheuristic artifacts: `results/metaheuristic_results`.
-- Logs: `results/logs`.
-- Visualizations: `results/visualizations`.
-- Hyperparameter plots: `results/hyperparam_plots/params_lr_vs_objective.png`.
+- `main_py.py`: Memory-optimized training, validation every 100 iterations, integrated metaheuristics
+- `main.py`: Alternate training/optimization script with configurable `val_every`
+- `model_directional_query_od.py`: Full model architecture and building blocks
+- `utils_train.py`: Arguments, datasets, metrics, loss, and monitoring utilities
+- `datasets/`: Dataset utilities and mask generation logic
+- `test.py`: Inference pipeline, metric reporting, and visualizations
+- `results/`: Saved metrics (`.csv`), best stats (`.txt`), and weights (`.pth`)
 
 ## Troubleshooting
 
-- Mixed precision is disabled by default (`USE_MIXED_PRECISION = False`) due to stability; training runs in FP32.
-- If you encounter CUDA OOM, reduce `batch_size`, use smaller `num_blocks/channels`, or enable `PYTORCH_CUDA_ALLOC_CONF`.
-- Ensure `seaborn` is installed if using `main_py.py` visualizations.
-- `pytorch_wavelets` may require specific PyTorch/CUDA builds; consult upstream docs.
+- CUDA OOM: Reduce `batch_size` or `patch_size` in `utils_train.py` args; consider CPU training.
+- Mixed precision issues: `main_py.py` disables AMP for stability; leave as FP32.
+- Missing data: Ensure `--data_path` and `--data_path_test` exist and contain images.
+- Validation cadence: In `main_py.py` it is fixed at `100`; in `main.py` pass `--val_every 100` to match.
+- Slow I/O: Preprocess datasets and use SSD; set `num_workers=0` if encountering Windows `DataLoader` issues.
 
-## Changelog
+## Notes for Developers
 
-- 0.5.0
-  - New advanced compositing script `organic_patch_composite.py` with pipelines: `fbm_poisson`, `voronoi_laplacian`, `flow_laplacian`, and optional `vae_masks`.
-  - Blending utilities: soft alpha (`smoothstep`), Laplacian pyramid blending, Poisson color harmonization.
-  - Dataset runner CLI for large-scale generation; saves `input/`, `target/`, and donor references.
-  - GPU/CPU fallback using PyTorch for noise/blur operations; `--cpu_only` flag.
-  - Updated `scribble_mask_flow.py`: added GPU acceleration and `collage_overlay` style with `--overlay_images_dir`.
-
-- 0.4.1
-  - Documentation: comprehensive README with architecture, setup, usage, dependencies, and changelog.
-- 0.4.0
-  - Integrated metaheuristics manager (`main_py.py`) with GA+PSO+DE+BO and memory-optimized training.
-- 0.3.2
-  - Inference pipeline improvements (`inference_inpaint.py`): robust IO, JSON config loading.
-- 0.3.0
-  - Enhanced mask generation (`x.py`): composite/enhanced modes, face preservation, opaque overlays.
-- 0.2.0
-  - ODConv2d integration (`odconv.py`) and transformer attention blocks; multi-loss training.
-- 0.1.0
-  - Initial training loop, dataset, and basic utilities.
-
-## Contributing
-
-- Pull requests welcome. Please include clear descriptions and focused changes.
-- For larger features, open an issue to discuss design and integration.
-
-## Citation
-
-If you use this repository in academic work, please cite the project and relevant upstream papers (ODConv, transformer attention, wavelet SSL).
+- Progressive training rebuilds the dataset at each milestone; expect cache misses on first load.
+- Metrics are evaluated on the Y channel to reflect perceptual luminance quality.
+- Best model saving requires simultaneous improvement in PSNR and SSIM.
+- Metaheuristic budgets in `main_py.py` are reduced (e.g., GA/PSO/DE set to 10) for stability.
 
 ## License
 
-No license file is included. Please add a `LICENSE` file (MIT recommended) to specify terms.
+MIT License. See `LICENSE` for details.

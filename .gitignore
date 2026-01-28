@@ -10,7 +10,9 @@
 *.h5
 *.ckpt
 *.mp4
-
+*.jpg
+*.png
+*.pdf
 # Python cache
 __pycache__/
 *.pyc
@@ -22,7 +24,30 @@ __pycache__/
 venv/
 .venv/
 
-#code.zip
-#comparison.zip
-#datasetceleb.zip
-#filestructure.txt
+results/
+NewImgs/
+datasets/
+dataset_PUSHKAR/
+analysis/
+tests/
+dataset.zip
+dataset_PUSHKAR.zip
+scripts/
+
+preview_out/
+structured_styles/
+
+MaskGen.py
+scribble_mask_flow.py
+test.zip
+structured_styles.zip
+code.zip
+comparison.zip
+datasetceleb.zip
+filestructure.txt
+
+.agent/
+paper/
+wave-mamba/
+ICML2026StyleSheet/
+DataSetFiles/
