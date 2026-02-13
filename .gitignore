@@ -47,12 +47,14 @@ datasetceleb.zip
 filestructure.txt
 
 .agent/
+.claude/
 paper/
 wave-mamba/
 ICML2026StyleSheet/
-DataSetFiles/
 evaluation/
 checkpoints/
+implementation_plan.md
+experiments_plan.md
 
 copyOfMain.py
 evaluate_metrics.py
@@ -65,3 +67,4 @@ test_pipeline.py
 test.py
 wavelet_guided_ssm.md
 test.py
+

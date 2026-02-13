@@ -5,14 +5,7 @@ import torchvision
 from pytorch_wavelets import DWTForward, DWTInverse
 import matplotlib.pyplot as plt
 from odconv import ODConv2d
-
-# Mamba SSM import with graceful fallback to PureSSM
-try:
-    from mamba_ssm import Mamba
-    MAMBA_AVAILABLE = True
-except ImportError:
-    MAMBA_AVAILABLE = False
-    # PureSSM (pure PyTorch) will be used instead - no warning needed
+from fass_ssm import FrequencyAdaptiveSSM, DualStreamFASS
 
 
 
@@ -521,45 +514,41 @@ class WaveletGuidedSSM(nn.Module):
 
 class MambaAttention(nn.Module):
     """
-    Wavelet-Guided Selective State Space Model for O(N) context modeling.
-    Uses WaveletGuidedSSM - our novel contribution with frequency-modulated B, C, Δ.
+    Frequency-Adaptive SSM for O(N) context modeling.
+    ALWAYS uses FrequencyAdaptiveSSM - our core contribution.
     Preserves SSL (Wavelet Query) for quality parity with Transformer.
     """
     def __init__(self, channels, d_state=16, d_conv=4, expand=2, kernel_size=3):
         super(MambaAttention, self).__init__()
         self.channels = channels
-        
-        if MAMBA_AVAILABLE:
-            self.mamba = Mamba(d_model=channels, d_state=d_state, d_conv=d_conv, expand=expand)
-            self.uses_wgssm = False
-        else:
-            # Use Wavelet-Guided SSM (our novel contribution!)
-            self.mamba = WaveletGuidedSSM(d_model=channels, d_state=d_state, d_conv=d_conv, expand=expand)
-            self.uses_wgssm = True
-        
+
+        self.mamba = FrequencyAdaptiveSSM(
+            d_model=channels,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            use_snake_scan=True,
+            use_local_enhancement=True
+        )
+
         self.norm = nn.LayerNorm(channels)
-        # CRITICAL: Preserve SSL for wavelet-aware queries (key for quality)
         self.ssl = SSL(channels, kernel_size)
         self.project_out = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        
+
     def forward(self, x, return_attn=False):
         b, c, h, w = x.shape
-        
-        # Apply Wavelet Query enhancement (preserves quality)
+
         q = self.ssl(x)
-        
-        # Flatten for Mamba: (B, C, H, W) -> (B, L, C)
+
         x_seq = q.flatten(2).transpose(1, 2)
-        
-        # Apply Mamba SSM (or PureSSM fallback)
-        out_seq = self.mamba(self.norm(x_seq))
-        
-        # Reshape back: (B, L, C) -> (B, C, H, W)
+
+        out_seq = self.mamba(self.norm(x_seq), h, w)
+
         out = out_seq.transpose(1, 2).view(b, c, h, w)
         out = self.project_out(out)
-        
+
         if return_attn:
-            return out, None  # Mamba has no explicit attention map
+            return out, None
         return out
 
 

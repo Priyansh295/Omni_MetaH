@@ -114,8 +114,6 @@ class ODConv2d(nn.Module):
         self.attention.update_temperature(temperature)
 
     def _forward_impl_common(self, x):
-        # Multiplying channel attention (or filter attention) to weights and feature maps are equivalent,
-        # while we observe that when using the latter method the models will run faster with less gpu memory cost.
         channel_attention, filter_attention, spatial_attention, kernel_attention = self.attention(x)
         batch_size, in_planes, height, width = x.size()
         x = x * channel_attention
@@ -133,7 +131,7 @@ class ODConv2d(nn.Module):
 
 
         output = output * filter_attention
-   
+
         return output
 
     def _forward_impl_pw1x(self, x):

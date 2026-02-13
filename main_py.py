@@ -218,80 +218,85 @@ def apply_optimized_params(args):
     print(f"  Loss weights: L1={args.loss_weights[0]:.3f}, Perceptual={args.loss_weights[1]:.3f}, SSIM={args.loss_weights[2]:.3f}, Edge={args.loss_weights[3]:.3f}")
 
 
-def train_and_evaluate(num_blocks, num_heads, channels, lr, batch_size, expansion_factor, num_refinement, loss_weights, 
+_DATA_SPLIT_CACHE = {}
+
+def get_or_create_data_split(data_path, val_split=0.2, seed=42):
+    """
+    Get or create a reproducible train/val split for the given data path.
+    This ensures the SAME split is used across all optimization trials.
+    """
+    cache_key = (data_path, val_split, seed)
+    if cache_key in _DATA_SPLIT_CACHE:
+        return _DATA_SPLIT_CACHE[cache_key]
+
+    inp_files = sorted(
+        glob.glob(f'{data_path}/inp/*.png') +
+        glob.glob(f'{data_path}/inp/*.jpg') +
+        glob.glob(f'{data_path}/inp/*.jpeg') +
+        glob.glob(f'{data_path}/inp/*.PNG') +
+        glob.glob(f'{data_path}/inp/*.JPG') +
+        glob.glob(f'{data_path}/input/*.png') +
+        glob.glob(f'{data_path}/input/*.jpg') +
+        glob.glob(f'{data_path}/input/*.jpeg') +
+        glob.glob(f'{data_path}/input/*.PNG') +
+        glob.glob(f'{data_path}/input/*.JPG')
+    )
+    target_files = sorted(
+        glob.glob(f'{data_path}/target/*.png') +
+        glob.glob(f'{data_path}/target/*.jpg') +
+        glob.glob(f'{data_path}/target/*.jpeg') +
+        glob.glob(f'{data_path}/target/*.PNG') +
+        glob.glob(f'{data_path}/target/*.JPG') +
+        glob.glob(f'{data_path}/gt/*.png') +
+        glob.glob(f'{data_path}/gt/*.jpg') +
+        glob.glob(f'{data_path}/gt/*.jpeg') +
+        glob.glob(f'{data_path}/gt/*.PNG') +
+        glob.glob(f'{data_path}/gt/*.JPG')
+    )
+
+    if len(inp_files) == 0 or len(target_files) == 0:
+        return None, None, None, None
+
+    min_len = min(len(inp_files), len(target_files))
+    inp_files = inp_files[:min_len]
+    target_files = target_files[:min_len]
+
+    rng = random.Random(seed)
+    indices = list(range(min_len))
+    rng.shuffle(indices)
+    split_idx = int(min_len * (1 - val_split))
+
+    train_indices = indices[:split_idx]
+    val_indices = indices[split_idx:]
+
+    train_inp = [inp_files[i] for i in train_indices]
+    train_target = [target_files[i] for i in train_indices]
+    val_inp = [inp_files[i] for i in val_indices]
+    val_target = [target_files[i] for i in val_indices]
+
+    _DATA_SPLIT_CACHE[cache_key] = (train_inp, train_target, val_inp, val_target)
+    print(f"[Data Split] Created split: {len(train_inp)} train, {len(val_inp)} val (seed={seed})")
+
+    return train_inp, train_target, val_inp, val_target
+
+
+def train_and_evaluate(num_blocks, num_heads, channels, lr, batch_size, expansion_factor, num_refinement, loss_weights,
                        kernel_size=3, act_type='gelu', norm_type='layernorm',
                        use_dwa=False, dwa_temp=2.0, val_split=0.2,
-                       num_iter=100, data_path='./Blind_Omni_Wav_Net/datasets/celeb', data_path_test='./Blind_Omni_Wav_Net/datasets/celeb'):
+                       num_iter=100, data_path='./Blind_Omni_Wav_Net/datasets/celeb', data_path_test='./Blind_Omni_Wav_Net/datasets/celeb',
+                       pre_split_data=None):
     """Updated train_and_evaluate with longer training iterations for more stable evaluation"""
-    # Clear cache before starting
     torch.cuda.empty_cache()
     try:
-        # Discover input files (support both inp/input folders and png/jpg/jpeg/PNG/JPG)
-        inp_files = sorted(
-            glob.glob(f'{data_path}/inp/*.png') + 
-            glob.glob(f'{data_path}/inp/*.jpg') +
-            glob.glob(f'{data_path}/inp/*.jpeg') +
-            glob.glob(f'{data_path}/inp/*.PNG') +
-            glob.glob(f'{data_path}/inp/*.JPG') +
-            glob.glob(f'{data_path}/input/*.png') + 
-            glob.glob(f'{data_path}/input/*.jpg') +
-            glob.glob(f'{data_path}/input/*.jpeg') +
-            glob.glob(f'{data_path}/input/*.PNG') +
-            glob.glob(f'{data_path}/input/*.JPG')
-        )
-        target_files = sorted(
-            glob.glob(f'{data_path}/target/*.png') + 
-            glob.glob(f'{data_path}/target/*.jpg') +
-            glob.glob(f'{data_path}/target/*.jpeg') +
-            glob.glob(f'{data_path}/target/*.PNG') +
-            glob.glob(f'{data_path}/target/*.JPG') +
-            glob.glob(f'{data_path}/gt/*.png') +
-            glob.glob(f'{data_path}/gt/*.jpg') +
-            glob.glob(f'{data_path}/gt/*.jpeg') +
-            glob.glob(f'{data_path}/gt/*.PNG') +
-            glob.glob(f'{data_path}/gt/*.JPG')
-        )
+        if pre_split_data is not None:
+            train_inp, train_target, val_inp, val_target = pre_split_data
+        else:
+            split_result = get_or_create_data_split(data_path, val_split)
+            if split_result[0] is None:
+                print(f"WARNING: No files found at {data_path}")
+                return float('inf')
+            train_inp, train_target, val_inp, val_target = split_result
 
-        # Explicitly confirm folder structure to user
-        if os.path.exists(os.path.join(data_path, 'input')):
-            print(f"  [Info] Detected 'input' folder in {data_path}")
-        if os.path.exists(os.path.join(data_path, 'target')):
-            print(f"  [Info] Detected 'target' folder in {data_path}")
-        
-        # Debug: check if files found from 'input' vs 'inp'
-        if len(inp_files) > 0:
-            print(f"  [Info] First input file found: {os.path.basename(inp_files[0])}")
-        
-        # Debug: print what was found
-        if len(inp_files) == 0 or len(target_files) == 0:
-            print(f"WARNING: No files found at {data_path}")
-            print(f"  Looking for: inp/, input/, target/, gt/ subfolders")
-            print(f"  Found inp_files: {len(inp_files)}, target_files: {len(target_files)}")
-            if os.path.exists(data_path):
-                print(f"  Contents of {data_path}: {os.listdir(data_path)}")
-            return float('inf')
-        
-        # Ensure pairing
-        min_len = min(len(inp_files), len(target_files))
-        inp_files = inp_files[:min_len]
-        target_files = target_files[:min_len]
-        
-        print(f"Found {min_len} image pairs in {data_path}")
-        
-        # Shuffle and split
-        indices = list(range(min_len))
-        random.shuffle(indices)
-        split_idx = int(min_len * (1 - val_split))
-        
-        train_indices = indices[:split_idx]
-        val_indices = indices[split_idx:]
-        
-        train_inp = [inp_files[i] for i in train_indices]
-        train_target = [target_files[i] for i in train_indices]
-        
-        val_inp = [inp_files[i] for i in val_indices]
-        val_target = [target_files[i] for i in val_indices]
-        
         length = len(train_inp)
 
         if length == 0:
@@ -512,14 +517,18 @@ def train_and_evaluate(num_blocks, num_heads, channels, lr, batch_size, expansio
 def run_improved_optimization(args):
     """Improved metaheuristic optimization with better exploration"""
     print("Running improved metaheuristic optimization...")
-    
-    # SOLUTION 1: Increased budgets significantly
-    # SOLUTION 1: Increased budgets significantly
+
     GA_BUDGET = 25
     PSO_BUDGET = 25
     DE_BUDGET = 25
     BO_TRIALS = 25
-    TRAINING_ITERS = 100  # Increased to 100 for better signal on GPU
+    TRAINING_ITERS = 100
+
+    print("[Data Split] Creating reproducible train/val split ONCE before optimization...")
+    pre_split_data = get_or_create_data_split(args.data_path, val_split=0.2, seed=42)
+    if pre_split_data[0] is None:
+        print("ERROR: Could not create data split. Check data_path.")
+        return None
 
     def clamp(val, minval, maxval):
         return max(minval, min(val, maxval))
@@ -637,10 +646,11 @@ def run_improved_optimization(args):
                 kernel_size=seed.get('kernel_size', 3),
                 act_type=seed.get('act_type', 'gelu'),
                 norm_type=seed.get('norm_type', 'layernorm'),
-                use_dwa=True, dwa_temp=2.0, # Enable DWA for GA
+                use_dwa=True, dwa_temp=2.0,
                 num_iter=TRAINING_ITERS,
                 data_path=args.data_path,
-                data_path_test=args.data_path_test
+                data_path_test=args.data_path_test,
+                pre_split_data=pre_split_data
             )
             ga_optimizer.tell(ga_candidate, ga_value)
             print(f"GA seed {i+1} evaluation: {ga_value}")
@@ -700,7 +710,8 @@ def run_improved_optimization(args):
                 use_dwa=True, dwa_temp=seed.get('dwa_temp', 2.0),
                 num_iter=TRAINING_ITERS,
                 data_path=args.data_path,
-                data_path_test=args.data_path_test
+                data_path_test=args.data_path_test,
+                pre_split_data=pre_split_data
             )
             pso_optimizer.tell(pso_candidate, pso_seed_value)
             print(f"PSO seed {i+1} evaluation: {pso_seed_value}")
@@ -743,7 +754,8 @@ def run_improved_optimization(args):
                 use_dwa=True, dwa_temp=2.0,
                 num_iter=TRAINING_ITERS,
                 data_path=args.data_path,
-                data_path_test=args.data_path_test
+                data_path_test=args.data_path_test,
+                pre_split_data=pre_split_data
             )
             de_optimizer.tell(de_candidate, de_seed_value)
             print(f"DE seed {i+1} evaluation: {de_seed_value}")
@@ -806,12 +818,13 @@ def run_improved_optimization(args):
         else:
             expansion_factor = OPTIMIZED_PARAMS['expansion_factor']
         
-        return train_and_evaluate(num_blocks, num_heads, channels, lr, batch_size, 
-                                expansion_factor, num_refinement, loss_weights, 
+        return train_and_evaluate(num_blocks, num_heads, channels, lr, batch_size,
+                                expansion_factor, num_refinement, loss_weights,
                                 kernel_size=kernel_size, act_type=act_type, norm_type=norm_type,
                                 use_dwa=True, dwa_temp=dwa_temp,
-                                num_iter=num_iter, data_path=args.data_path, 
-                                data_path_test=args.data_path_test)
+                                num_iter=num_iter, data_path=args.data_path,
+                                data_path_test=args.data_path_test,
+                                pre_split_data=pre_split_data)
 
     study = optuna.create_study(direction='minimize')
     study.optimize(bo_objective, n_trials=BO_TRIALS)
@@ -965,7 +978,7 @@ def run_training(args, use_optimized=False, resume=False):
                     ssim_loss = 1 - ssim(out, norain)
                     edge_out = kornia.filters.sobel(out,  normalized=True, eps=1e-06)
                     edge_gt = kornia.filters.sobel(norain, normalized=True, eps=1e-06)
-                    edge_loss = F.l1_loss(edge_out[0], edge_gt[0]) 
+                    edge_loss = F.l1_loss(edge_out, edge_gt) 
 
                     # Base loss
                     loss = (F.l1_loss(out, norain)*loss_weights[0] + perceptual_loss(out, norain)*loss_weights[1] + ssim_loss*loss_weights[2] + edge_loss*loss_weights[3])
@@ -1017,7 +1030,7 @@ def run_training(args, use_optimized=False, resume=False):
                             ssim_loss = 1 - ssim(out, norain)
                             edge_out = kornia.filters.sobel(out,  normalized=True, eps=1e-06)
                             edge_gt = kornia.filters.sobel(norain, normalized=True, eps=1e-06)
-                            edge_loss = F.l1_loss(edge_out[0], edge_gt[0]) 
+                            edge_loss = F.l1_loss(edge_out, edge_gt) 
                             
                             loss = (F.l1_loss(out, norain)*loss_weights[0] + perceptual_loss(out, norain)*loss_weights[1] + ssim_loss*loss_weights[2] + edge_loss*loss_weights[3]) / fallback_accum
                             

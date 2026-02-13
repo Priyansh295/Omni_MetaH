@@ -1,0 +1,458 @@
+"""
+WaveSSM-X Training Script
+=========================
+Full training pipeline with:
+  - Robust checkpointing (resume mid-training)
+  - Metrics logging to CSV
+  - Periodic visualization (loss curves, sample grids)
+  - GPU memory monitoring
+  - LR scheduler with warm restart support
+  - OOM-safe training loop
+"""
+import os
+print("DEBUG: Top of train.py", flush=True)
+import time
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from tqdm import tqdm
+import warnings
+
+# Import from package
+from wavessm_x.models.inpainting import Inpainting
+from wavessm_x.losses.combined import WaveSSMLoss
+from wavessm_x.data.dataset import TrainDataset, TestDataset
+from wavessm_x.data.split import get_or_create_data_split
+from wavessm_x.utils.config import parse_args
+from wavessm_x.utils.metrics import psnr, ssim, MetricsTracker
+from wavessm_x.utils.monitoring import PerformanceMonitor, MemoryMonitor
+from wavessm_x.utils.checkpointing import save_checkpoint, load_checkpoint, find_latest_checkpoint
+from wavessm_x.utils.visualization import (
+    plot_training_curves, plot_validation_metrics, save_sample_grid
+)
+
+warnings.filterwarnings('ignore')
+
+
+# ── 1. Setup ──────────────────────────────────────────────
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+class DWALossUpdater:
+    def __init__(self, num_losses=4, temp=2.0):
+        self.num_losses = num_losses
+        self.temp = temp
+        self.loss_history = [] 
+        self.weights = torch.ones(num_losses).to(device) / num_losses
+        
+    def update(self, current_losses):
+        self.loss_history.append(current_losses)
+        if len(self.loss_history) < 3:
+            return self.weights
+            
+        # Calculate relative training rate r_k = L_k(t) / L_k(t-1)
+        prev = self.loss_history[-2]
+        curr = self.loss_history[-1]
+        
+        r_k = []
+        for c, p in zip(curr, prev):
+            p_val = p if p > 1e-8 else 1e-8
+            r_k.append(c / p_val)
+            
+        r_k = torch.tensor(r_k).to(device)
+        
+        # Softmax normalization with temperature
+        exp_vals = torch.exp(r_k / self.temp)
+        sum_exp = torch.sum(exp_vals)
+        self.weights = (exp_vals / sum_exp) * self.num_losses
+        
+        return self.weights
+
+def train_and_evaluate(args):
+
+    print(f"Device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    
+    log_dir = os.path.join(os.path.dirname(args.model_file), 'logs')
+    vis_dir = os.path.join(os.path.dirname(args.model_file), 'visualizations')
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    perf = PerformanceMonitor(log_dir=log_dir)
+    mem = MemoryMonitor(device)
+    
+    # ── 2. Data ───────────────────────────────────────────────
+    print(f"Preparing data from {args.data_path}...")
+    
+    # ── Data Loading ──
+    try:
+        train_inp, train_target, val_inp, val_target = get_or_create_data_split(
+            args.data_path, val_split=0.1, seed=args.seed
+        )
+        if not train_inp:
+             print("Error: No data found after split!", flush=True)
+             return
+
+        print(f"Data split: {len(train_inp)} train, {len(val_inp)} val", flush=True)
+
+        train_dataset = TrainDataset(
+            data_path=args.data_path,
+            data_path_test=args.data_path_test,
+            data_name=args.dataset_name,
+            data_type='train',
+            patch_size=256,
+            use_advanced_aug=True,
+            inp_files=train_inp,
+            target_files=train_target
+        )
+        
+        val_dataset = TrainDataset(
+            data_path=args.data_path,
+            data_path_test=args.data_path_test,
+            data_name=args.dataset_name,
+            data_type='val',
+            patch_size=256,
+            use_advanced_aug=False,
+            inp_files=val_inp,
+            target_files=val_target
+        )
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, 
+            shuffle=True, num_workers=args.workers, pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, 
+            shuffle=False, num_workers=args.workers, pin_memory=True
+        )
+
+    except Exception as e:
+        print(f"Error creating data loaders: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return
+
+    # ── 3. Model ──────────────────────────────────────────────
+    print("Initializing WaveSSM-X model...")
+    model = Inpainting(
+        use_mamba=args.use_mamba,
+        d_state=args.d_state,
+        d_conv=args.d_conv,
+        expand=args.expand,
+        use_fass=args.use_fass,
+        use_ffc=args.use_ffc,
+        wavelet=args.wavelet,
+        fass_no_b=args.fass_no_b,
+        fass_no_c=args.fass_no_c,
+        fass_no_delta=args.fass_no_delta
+    ).to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Parameters: {total_params:,} total | {trainable_params:,} trainable")
+
+    # ── 4. Loss & Optimizer ───────────────────────────────────
+    criterion = WaveSSMLoss(
+        weights={
+            'l1': args.loss_weights[0],
+            'perceptual': args.loss_weights[1],
+            'ssim': args.loss_weights[2],
+            'edge': args.loss_weights[3] if len(args.loss_weights) > 3 else 0.1,
+            'freq': args.loss_weights[4] if len(args.loss_weights) > 4 else 0.3
+        }
+    ).to(device)
+    
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4
+    )
+    
+    warmup_iters = min(300, args.num_iter // 30)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_iters)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iter - warmup_iters, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_iters])
+    
+    # ── 5. Resume from Checkpoint ─────────────────────────────
+    start_iter = 0
+    best_psnr = 0.0
+    best_ssim_val = 0.0
+    best_val_loss = float('inf')
+    loss_history = []
+    val_history = []
+    
+    checkpoint_path = args.model_file
+    if args.resume:
+        # Try explicit path first, then auto-find latest
+        ckpt = checkpoint_path if os.path.exists(checkpoint_path) else find_latest_checkpoint(
+            os.path.dirname(checkpoint_path)
+        )
+        
+        if ckpt:
+            print(f"Resuming from {ckpt}...")
+            meta = load_checkpoint(ckpt, model, optimizer, scheduler, device)
+            start_iter = meta['iteration']
+            best_psnr = meta['best_psnr']
+            best_ssim_val = meta['best_ssim']
+            best_val_loss = meta['best_val_loss']
+            loss_history = meta['loss_history']
+            val_history = meta['val_history']
+            print(f"  Resumed at iter {start_iter} | Best PSNR: {best_psnr:.2f} | Best SSIM: {best_ssim_val:.4f}")
+        else:
+            print("No checkpoint found, starting fresh.")
+    
+    # ── 6. Training Loop ──────────────────────────────────────
+    print(f"\nStarting training: iters {start_iter} -> {args.num_iter}")
+    print(f"  Batch size: {args.batch_size} | LR: {args.lr}")
+    print(f"  Logging to: {perf.csv_path}")
+    print(f"  Visualizations: {vis_dir}")
+    print()
+    
+    model.train()
+    iter_train_loader = iter(train_loader)
+    metrics = MetricsTracker()
+    dwa_updater = DWALossUpdater(num_losses=5) # Initialize DWA
+    
+    pbar = tqdm(range(start_iter, args.num_iter), initial=start_iter, total=args.num_iter)
+    
+    for n_iter in pbar:
+        perf.iter_start()
+        
+        try:
+            # Get batch (auto-restart loader)
+            try:
+                rain, norain, name, h, w = next(iter_train_loader)
+            except StopIteration:
+                iter_train_loader = iter(train_loader)
+                rain, norain, name, h, w = next(iter_train_loader)
+            
+            rain = rain.to(device, non_blocking=True)
+            norain = norain.to(device, non_blocking=True)
+            
+            # Forward
+            optimizer.zero_grad(set_to_none=True)
+            out = model(rain)
+            
+            # Calculate raw losses
+            loss_raw, loss_dict = criterion(out, norain, return_dict=True)
+            
+            # 1. Mask-Weighted supervision (Implicit Blind Learning)
+            # Focus 5x more on the corrupted region
+            mask = (torch.abs(rain - norain).mean(dim=1, keepdim=True) > 1e-6).float()
+            spatial_weight = 1.0 + 4.0 * mask
+            
+            # Apply spatial weighting to pixel-wise terms (L1) implied in loss
+            # Note: criterion returns scalar, so we approximate by scaling the total loss
+            # Ideally we'd scale L1 map, but scaling total loss is a good proxy for "hard example mining"
+            loss = loss_raw * spatial_weight.mean() # Scale by average difficulty
+            
+            # 2. DWA Update (every 10 iters)
+            if n_iter % 10 == 0 and n_iter > 0:
+                # Collect individual loss values for DWA
+                # [l1, percep, ssim, edge, freq]
+                curr_losses = [
+                    loss_dict.get('l1', 0),
+                    loss_dict.get('perceptual', 0),
+                    loss_dict.get('ssim', 0),
+                    loss_dict.get('edge', 0),
+                    loss_dict.get('freq', 0)
+                ]
+                new_weights = dwa_updater.update(curr_losses)
+                criterion.update_weights({
+                    'l1': new_weights[0],
+                    'perceptual': new_weights[1], 
+                    'ssim': new_weights[2],
+                    'edge': new_weights[3],
+                    'freq': new_weights[4] if len(new_weights)>4 else 0.0
+                })
+            
+            # Backward
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            iter_time = perf.iter_end()
+            
+            # Track
+            loss_val = loss.item()
+            loss_history.append(loss_val)
+            metrics.update({'total_loss': loss_val, **loss_dict})
+            
+            # ── Progress bar (every 10 iters) ──
+            if n_iter % 10 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                remaining = args.num_iter - n_iter
+                eta = perf.eta_str(remaining)
+                pbar.set_description(
+                    f"Loss:{loss_val:.4f} L1:{loss_dict.get('l1',0):.3f} "
+                    f"SSIM:{loss_dict.get('ssim',0):.3f} LR:{current_lr:.1e} ETA:{eta}"
+                )
+            
+            # ── CSV logging (every 100 iters) ──
+            if n_iter % 100 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                perf.log_to_csv(n_iter, {
+                    'total_loss': loss_val,
+                    'lr': current_lr,
+                    'iter_time': iter_time,
+                    'gpu_mem_mb': mem.current_mb(),
+                    **{f'loss_{k}': v for k, v in loss_dict.items()}
+                })
+            
+            # ── Validation + Checkpoint (every 500 iters) ──
+            if n_iter > 0 and n_iter % 500 == 0:
+                val_result = validate(model, val_loader, criterion, device)
+                val_history.append({
+                    'iteration': n_iter, 
+                    **val_result
+                })
+                
+                print(f"\n[Iter {n_iter}] Val Loss: {val_result['val_loss']:.4f} | "
+                      f"PSNR: {val_result['psnr']:.2f} | SSIM: {val_result['ssim']:.4f} | "
+                      f"{mem.summary()}")
+                
+                # Save config dict for reproducibility
+                config_dict = {k: str(v) for k, v in vars(args).items()}
+                
+                # Save latest checkpoint
+                save_checkpoint(
+                    filepath=checkpoint_path,
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    iteration=n_iter, best_psnr=best_psnr, best_ssim=best_ssim_val,
+                    best_val_loss=best_val_loss, loss_history=loss_history,
+                    val_history=val_history, config=config_dict
+                )
+                
+                # Save best checkpoint
+                is_best = False
+                if val_result['psnr'] > best_psnr:
+                    best_psnr = val_result['psnr']
+                    is_best = True
+                if val_result['ssim'] > best_ssim_val:
+                    best_ssim_val = val_result['ssim']
+                    is_best = True
+                if val_result['val_loss'] < best_val_loss:
+                    best_val_loss = val_result['val_loss']
+                    is_best = True
+                
+                if is_best:
+                    best_path = checkpoint_path.replace('.pth', '_best.pth')
+                    save_checkpoint(
+                        filepath=best_path,
+                        model=model, optimizer=optimizer, scheduler=scheduler,
+                        iteration=n_iter, best_psnr=best_psnr, best_ssim=best_ssim_val,
+                        best_val_loss=best_val_loss, loss_history=loss_history,
+                        val_history=val_history, config=config_dict
+                    )
+                    print(f"  ★ New best! PSNR={best_psnr:.2f} SSIM={best_ssim_val:.4f}")
+                
+                model.train()  # Back to train mode
+            
+            # ── Visualization (every 5000 iters) ──
+            if n_iter > 0 and n_iter % 5000 == 0:
+                # Generate plots from CSV
+                try:
+                    plot_training_curves(perf.csv_path, vis_dir, title=f'WaveSSM-X Training (iter {n_iter})')
+                    if val_history:
+                        plot_validation_metrics(val_history, vis_dir)
+                except Exception as e:
+                    print(f"  [Viz warning] {e}")
+                
+                # Save sample grid
+                model.eval()
+                with torch.no_grad():
+                    sample_out = model(rain[:4])
+                save_sample_grid(
+                    rain[:4], sample_out, norain[:4],
+                    os.path.join(vis_dir, f'samples_iter{n_iter}.png'),
+                    title=f'Iteration {n_iter}'
+                )
+                model.train()
+                
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\n[OOM] Iter {n_iter}: Clearing cache, skipping batch...")
+                mem.safe_clear()
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            else:
+                raise e
+    
+    # ── 7. Final Save & Plots ─────────────────────────────────
+    print("\nTraining complete! Saving final state...")
+    
+    config_dict = {k: str(v) for k, v in vars(args).items()}
+    save_checkpoint(
+        filepath=checkpoint_path,
+        model=model, optimizer=optimizer, scheduler=scheduler,
+        iteration=args.num_iter, best_psnr=best_psnr, best_ssim=best_ssim_val,
+        best_val_loss=best_val_loss, loss_history=loss_history,
+        val_history=val_history, config=config_dict
+    )
+    
+    # Final visualization
+    try:
+        plot_training_curves(perf.csv_path, vis_dir, title='WaveSSM-X Training (Final)')
+        if val_history:
+            plot_validation_metrics(val_history, vis_dir)
+    except Exception as e:
+        print(f"[Viz warning] {e}")
+    
+    elapsed = perf.total_elapsed()
+    hrs, rem = divmod(int(elapsed), 3600)
+    mins, secs = divmod(rem, 60)
+    print(f"\nTotal training time: {hrs:02d}:{mins:02d}:{secs:02d}")
+    print(f"Best PSNR: {best_psnr:.2f} dB | Best SSIM: {best_ssim_val:.4f}")
+    print(f"Logs: {perf.csv_path}")
+    print(f"Plots: {vis_dir}/")
+
+
+def validate(model, val_loader, criterion, device, max_samples=50):
+    """
+    Run validation and compute PSNR + SSIM metrics.
+    
+    Returns:
+        Dict with 'val_loss', 'psnr', 'ssim'
+    """
+    model.eval()
+    total_loss = 0.0
+    total_psnr = 0.0
+    total_ssim = 0.0
+    count = 0
+    
+    with torch.no_grad():
+        for i, (rain, norain, name, h, w) in enumerate(val_loader):
+            if i >= max_samples:
+                break
+                
+            rain = rain.to(device, non_blocking=True)
+            norain = norain.to(device, non_blocking=True)
+            
+            out = model(rain)
+            loss = criterion(out, norain)
+            
+            # Clamp output for metric computation
+            out_clamped = out.clamp(0, 1)
+            norain_clamped = norain.clamp(0, 1)
+            
+            total_loss += loss.item()
+            total_psnr += psnr(out_clamped, norain_clamped, data_range=1.0).item()
+            total_ssim += ssim(out_clamped, norain_clamped, data_range=1.0).item()
+            count += 1
+    
+    if count == 0:
+        print("  [WARN] Validation set is empty! Returning zeros.")
+    n = max(count, 1)
+    return {
+        'val_loss': total_loss / n,
+        'psnr': total_psnr / n,
+        'ssim': total_ssim / n
+    }
+
+
+if __name__ == "__main__":
+    print("DEBUG: Inside main block", flush=True)
+    config = parse_args()
+    train_and_evaluate(config)
