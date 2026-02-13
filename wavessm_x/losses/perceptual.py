@@ -35,7 +35,11 @@ class VGGPerceptualLoss(nn.Module):
         if input.shape[1] != 3:
             input = input.repeat(1, 3, 1, 1)
             target = target.repeat(1, 3, 1, 1)
-            
+
+        # Clamp to valid range to prevent normalization overflow
+        input = input.clamp(0, 1)
+        target = target.clamp(0, 1)
+
         input = (input-self.mean) / self.std
         target = (target-self.mean) / self.std
         

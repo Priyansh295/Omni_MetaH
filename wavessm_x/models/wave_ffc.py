@@ -82,8 +82,9 @@ class WaveFFC(nn.Module):
             with torch.amp.autocast('cuda', enabled=False):
                 LL, _ = self.dwt(x.float())
             gate = self.freq_gate(F.interpolate(LL, size=x.shape[-2:], mode='bilinear', align_corners=False))
+            gate = gate.to(x.dtype)  # Match input dtype
         except RuntimeError:
-            gate = torch.ones_like(x) * 0.5
+            gate = torch.ones(x.shape, device=x.device, dtype=x.dtype) * 0.5
 
         out = torch.cat([local_out, global_out], dim=1)
         out = self.fusion(out * gate) + x

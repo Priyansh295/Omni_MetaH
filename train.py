@@ -423,12 +423,17 @@ def validate(model, val_loader, criterion, device, max_samples=50):
             rain = rain.to(device, non_blocking=True)
             norain = norain.to(device, non_blocking=True)
             
-            out = model(rain)
-            loss = criterion(out, norain)
+            with torch.amp.autocast('cuda'):
+                out = model(rain)
+                loss = criterion(out, norain)
+            
+            # Skip NaN batches instead of corrupting averages
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
             
             # Clamp output for metric computation
-            out_clamped = out.clamp(0, 1)
-            norain_clamped = norain.clamp(0, 1)
+            out_clamped = out.float().clamp(0, 1)
+            norain_clamped = norain.float().clamp(0, 1)
             
             total_loss += loss.item()
             total_psnr += psnr(out_clamped, norain_clamped, data_range=1.0).item()

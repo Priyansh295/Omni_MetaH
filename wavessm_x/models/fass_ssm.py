@@ -28,19 +28,24 @@ def parallel_scan(A: torch.Tensor, B: torch.Tensor, x: torch.Tensor) -> torch.Te
         Hidden states (B, L, d_inner, d_state)
     """
     B_batch, L, d_inner, d_state = A.shape
+    input_dtype = A.dtype
+
+    # Promote to float32 for numerical stability (exp overflow in float16)
+    A = A.float()
+    B = B.float()
+    x = x.float()
 
     log_A = torch.log(A.clamp(min=1e-6))
-    A_cumsum = torch.cumsum(log_A, dim=1).clamp(-30, 30)
+    A_cumsum = torch.cumsum(log_A, dim=1).clamp(-20, 20)  # Safe for float16 exp range
 
     x_expand = x.unsqueeze(-1)
     B_expand = B.unsqueeze(2)
-    # This broadcast works: (B, L, d_inner, 1) * (B, L, 1, d_state) -> (B, L, d_inner, d_state)
     input_contrib = x_expand * B_expand
 
     x_weighted = input_contrib * torch.exp(-A_cumsum)
     x_cumsum = torch.cumsum(x_weighted, dim=1)
 
-    return x_cumsum * torch.exp(A_cumsum)
+    return (x_cumsum * torch.exp(A_cumsum)).to(input_dtype)
 
 
 def snake_scan(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -281,13 +286,13 @@ class FrequencyAdaptiveSSM(nn.Module):
             # Delta Modulation (Step Size) - Controlled by Edge (LH+HL)
             if self.use_delta_mod:
                 dt_mod = torch.sigmoid(self.gamma * f_edge).unsqueeze(1)
-                dt = F.softplus(dt_base) * (0.5 + dt_mod)
+                dt = F.softplus(dt_base.clamp(-20, 20)) * (0.5 + dt_mod)
             else:
-                dt = F.softplus(dt_base)
+                dt = F.softplus(dt_base.clamp(-20, 20))
         else:
             B = B_base
             C = C_base
-            dt = F.softplus(dt_base)
+            dt = F.softplus(dt_base.clamp(-20, 20))
 
         dt = dt.clamp(self.dt_min, self.dt_max)
 
@@ -311,6 +316,9 @@ class FrequencyAdaptiveSSM(nn.Module):
                 D=self.D.float(), z=z_ssm, delta_softplus=False
             )
             y = y.transpose(1, 2)  # (B, L, d_inner)
+            # NaN guard to prevent gradient corruption
+            if torch.isnan(y).any():
+                y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
         else:
             # Fallback: pure PyTorch parallel scan
             dt_expand = dt.unsqueeze(-1).unsqueeze(-1)

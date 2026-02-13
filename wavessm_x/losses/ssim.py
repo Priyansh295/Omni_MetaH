@@ -37,8 +37,11 @@ def ssim(img1, img2, window_size=11, sigma=1.5, size_average=True, window=None):
 
     C1 = 0.01**2
     C2 = 0.03**2
+    eps = 1e-4  # float16-safe epsilon
 
-    ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+    numerator = (2*mu1_mu2 + C1) * (2*sigma12 + C2)
+    denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    ssim_map = numerator / (denominator + eps)
 
     if size_average:
         return ssim_map.mean()

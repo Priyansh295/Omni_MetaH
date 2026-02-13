@@ -34,8 +34,8 @@ class MaskAwareLoss(nn.Module):
             intersection = (pred_flat * target_flat).sum(dim=1)
             union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
             
-            # Dice coeff: 2*I / (U + eps)
-            dice = (2. * intersection + 1e-6) / (union + 1e-6)
+            # Dice coeff: 2*I / (U + eps) - use float16-safe epsilon
+            dice = (2. * intersection + 1e-4) / (union + 1e-4)
             loss += (1.0 - dice.mean()) * self.iou_weight
             
         return loss
