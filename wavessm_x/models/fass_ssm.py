@@ -192,21 +192,21 @@ class FrequencyAdaptiveSSM(nn.Module):
 
         try:
             x_2d = x.transpose(1, 2).view(b, d, height, width)
-            # DWT does not support float16 — force float32 under AMP
+            # DWT and projections in float32 for numerical stability
             with torch.amp.autocast('cuda', enabled=False):
                 yl, yh = self.dwt(x_2d.float())
-            yh_coeffs = yh[0]
-            lh = yh_coeffs[:, :, 0, :, :]
-            hl = yh_coeffs[:, :, 1, :, :]
-            hh = yh_coeffs[:, :, 2, :, :]
+                yh_coeffs = yh[0]
+                lh = yh_coeffs[:, :, 0, :, :]
+                hl = yh_coeffs[:, :, 1, :, :]
+                hh = yh_coeffs[:, :, 2, :, :]
 
-            yl_pooled = yl.mean(dim=(2, 3))
-            hh_pooled = hh.abs().mean(dim=(2, 3))
-            edge_pooled = (lh.abs() + hl.abs()).mean(dim=(2, 3))
+                yl_pooled = yl.mean(dim=(2, 3))
+                hh_pooled = hh.abs().mean(dim=(2, 3))
+                edge_pooled = (lh.abs() + hl.abs()).mean(dim=(2, 3))
 
-            f_struct = self.proj_struct(yl_pooled)
-            f_texture = self.proj_texture(hh_pooled)
-            f_edge = self.proj_edge(edge_pooled).squeeze(-1)
+                f_struct = self.proj_struct(yl_pooled)
+                f_texture = self.proj_texture(hh_pooled)
+                f_edge = self.proj_edge(edge_pooled).squeeze(-1)
 
             return f_struct, f_texture, f_edge, True
 
@@ -390,14 +390,15 @@ class DualStreamFASS(nn.Module):
             Output (B, C, H, W)
         """
         B, C, H, W = x.shape
+        input_dtype = x.dtype
 
         # DWT does not support float16 — force float32 under AMP
         with torch.amp.autocast('cuda', enabled=False):
             yl, yh = self.dwt(x.float())
-        yh_coeffs = yh[0]
-        lh = yh_coeffs[:, :, 0, :, :]
-        hl = yh_coeffs[:, :, 1, :, :]
-        hh = yh_coeffs[:, :, 2, :, :]
+            yh_coeffs = yh[0]
+            lh = yh_coeffs[:, :, 0, :, :]
+            hl = yh_coeffs[:, :, 1, :, :]
+            hh = yh_coeffs[:, :, 2, :, :]
 
         # Use ACTUAL DWT output dims (not H//2) because DWT padding can differ
         h_half, w_half = yl.shape[2], yl.shape[3]
@@ -418,12 +419,13 @@ class DualStreamFASS(nn.Module):
         # IDWT also requires float32
         with torch.amp.autocast('cuda', enabled=False):
             out = self.idwt((yl_refined.float(), [yh_out.float()]))
-        
+
         # Robustly handle DWT padding mismatches
         if out.shape[-2:] != (H, W):
             out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
-            
-        return out
+
+        # Match input dtype
+        return out.to(input_dtype)
 
 
 class CrossFrequencyAttention(nn.Module):
