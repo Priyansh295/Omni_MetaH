@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from .odconv import ODConv2d
 from .fass_ssm import FrequencyAdaptiveSSM, DualStreamFASS
 from .wave_ffc import MultiScaleWaveFFC
@@ -119,28 +120,15 @@ class MambaBlock(nn.Module):
                  wavelet='db3', ablation_flags=None):
         super(MambaBlock, self).__init__()
         
-        self.norm_type = norm_type.lower()
-        if self.norm_type == 'layernorm':
-             # Optimization: GroupNorm(1, C) is mathematically equivalent to LayerNorm
-             # but works on (B, C, H, W) without permuting
-             self.norm1 = nn.GroupNorm(1, channels)
-             self.norm2 = nn.GroupNorm(1, channels)
-        else:
-             self.norm1 = get_normalization(norm_type, channels)
-             self.norm2 = get_normalization(norm_type, channels)
+        # MambaAttention has its own internal GroupNorm, so we only need norm for FFN
+        self.norm2 = nn.GroupNorm(1, channels)
         
         self.attn = MambaAttention(channels, d_state, d_conv, expand, kernel_size, 
                                    wavelet=wavelet, ablation_flags=ablation_flags)
         self.ffn = GDFN(channels, expansion_factor, kernel_size, act_type)
 
     def forward(self, x, return_attn=False):
-        # Attention (MambaAttention has internal Norm, so we skip norm1 here or use it?)
-        # Standard implementation: x = x + attn(norm1(x))
-        # But MambaAttention usually takes raw x and norms internally. 
-        # Current code: x = x + x_in (residual). MambaAttention does x_seq = self.norm(x_seq).
-        # So we don't need norm1 here if MambaAttention does it.
-        # Let's keep it consistent with previous code structure but use GroupNorm logic if we were valid.
-        
+        # Attention path — MambaAttention applies its own internal GroupNorm
         x_in = x
         attn_out = self.attn(x, return_attn=return_attn) 
         if return_attn:
@@ -151,10 +139,7 @@ class MambaBlock(nn.Module):
         x = x + x_in
 
         # FFN with pre-norm
-        x_in = x
-        # Efficient 4D Norm
-        x_normed = self.norm2(x) 
-        x = self.ffn(x_normed) + x_in
+        x = self.ffn(self.norm2(x)) + x
 
         if return_attn:
             return x, attn_map
@@ -306,9 +291,12 @@ class Inpainting(nn.Module):
         x = self.input_conv(x)
         x_skip = []
 
-        # Encoder
+        # Encoder — gradient checkpointed to save activation memory
         for i, layer in enumerate(self.encoder_layers):
-            x = layer(x)
+            if self.training:
+                x = grad_checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
             x_skip.append(x)
             if i < len(self.downsample_layers):
                 x = self.downsample_layers[i](x)
@@ -317,11 +305,14 @@ class Inpainting(nn.Module):
         if self.bottleneck_fass is not None:
             x = self.bottleneck_fass(x) + x  # Residual for safe gradient flow
 
-        # Decoder
+        # Decoder — gradient checkpointed to save activation memory
         for i, layer in enumerate(self.decoder_layers):
             x = self.upsample_layers[i](x)
             x = x + x_skip[len(x_skip) - 2 - i]
-            x = layer(x)
+            if self.training:
+                x = grad_checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
 
         # Refinement: multi-scale FFT global context
         if self.refinement_ffc is not None:

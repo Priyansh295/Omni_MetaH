@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument('--workers', type=int, default=4, help='Data loader workers')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+    parser.add_argument('--val_every', type=int, default=500, help='Validation frequency (iterations)')
     
     # Loss weights
     parser.add_argument('--loss_weights', type=float, nargs='+', default=[1.0, 1.0, 1.0, 0.5, 0.3], 
@@ -67,6 +68,7 @@ class Config(object):
         self.workers = args.workers
         self.seed = args.seed
         self.resume = args.resume
+        self.val_every = args.val_every
         self.loss_weights = args.loss_weights
         
         # Ablation settings
@@ -89,7 +91,7 @@ def init_args(args):
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
-            cudnn.deterministic = True
-            cudnn.benchmark = False
+            cudnn.deterministic = False
+            cudnn.benchmark = True  # Fixed 256x256 patches → autotuning gives 20-30% speedup
             
     return Config(args)

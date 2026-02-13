@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.amp
 from pytorch_wavelets import DWTForward
 
 
@@ -19,8 +20,10 @@ class FrequencyAwareLoss(nn.Module):
     def forward(self, pred, target):
         loss = 0.0
         
-        pl, ph = self.dwt(pred)
-        tl, th = self.dwt(target)
+        # DWT does not support float16 — force float32 under AMP
+        with torch.amp.autocast('cuda', enabled=False):
+            pl, ph = self.dwt(pred.float())
+            tl, th = self.dwt(target.float())
         
         # LL Loss
         loss += self.loss_fn(pl, tl) * self.weights.get('LL', 1.0)
@@ -47,8 +50,10 @@ class AdaptiveFrequencyLoss(FrequencyAwareLoss):
         self.w_hh = nn.Parameter(torch.tensor(init_weights[3]))
 
     def forward(self, pred, target):
-        pl, ph = self.dwt(pred)
-        tl, th = self.dwt(target)
+        # DWT does not support float16 — force float32 under AMP
+        with torch.amp.autocast('cuda', enabled=False):
+            pl, ph = self.dwt(pred.float())
+            tl, th = self.dwt(target.float())
         
         loss_ll = self.loss_fn(pl, tl) * self.w_ll.abs()
         

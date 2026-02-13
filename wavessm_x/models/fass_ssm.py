@@ -183,7 +183,9 @@ class FrequencyAdaptiveSSM(nn.Module):
 
         try:
             x_2d = x.transpose(1, 2).view(b, d, height, width)
-            yl, yh = self.dwt(x_2d)
+            # DWT does not support float16 — force float32 under AMP
+            with torch.amp.autocast('cuda', enabled=False):
+                yl, yh = self.dwt(x_2d.float())
             yh_coeffs = yh[0]
             lh = yh_coeffs[:, :, 0, :, :]
             hl = yh_coeffs[:, :, 1, :, :]
@@ -361,7 +363,9 @@ class DualStreamFASS(nn.Module):
         """
         B, C, H, W = x.shape
 
-        yl, yh = self.dwt(x)
+        # DWT does not support float16 — force float32 under AMP
+        with torch.amp.autocast('cuda', enabled=False):
+            yl, yh = self.dwt(x.float())
         yh_coeffs = yh[0]
         lh = yh_coeffs[:, :, 0, :, :]
         hl = yh_coeffs[:, :, 1, :, :]
@@ -383,7 +387,9 @@ class DualStreamFASS(nn.Module):
         yl_refined = self.cross_attn(yl_out, (lh_out, hl_out, hh_out))
 
         yh_out = torch.stack([lh_out, hl_out, hh_out], dim=2)
-        out = self.idwt((yl_refined, [yh_out]))
+        # IDWT also requires float32
+        with torch.amp.autocast('cuda', enabled=False):
+            out = self.idwt((yl_refined.float(), [yh_out.float()]))
         
         # Robustly handle DWT padding mismatches
         if out.shape[-2:] != (H, W):

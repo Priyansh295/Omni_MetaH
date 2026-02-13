@@ -15,3 +15,7 @@ seaborn
 torchmetrics
 pytorch-fid
 scikit-image
+opencv-python-headless
+PyWavelets
+kornia
+pytorch_wavelets

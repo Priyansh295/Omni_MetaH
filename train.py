@@ -37,6 +37,7 @@ warnings.filterwarnings('ignore')
 
 # ── 1. Setup ──────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
 
 class DWALossUpdater:
@@ -229,28 +230,15 @@ def train_and_evaluate(args):
             
             rain = rain.to(device, non_blocking=True)
             norain = norain.to(device, non_blocking=True)
-            
-            # Forward
+
+            # Forward with AMP (mixed precision)
             optimizer.zero_grad(set_to_none=True)
-            out = model(rain)
-            
-            # Calculate raw losses
-            loss_raw, loss_dict = criterion(out, norain, return_dict=True)
-            
-            # 1. Mask-Weighted supervision (Implicit Blind Learning)
-            # Focus 5x more on the corrupted region
-            mask = (torch.abs(rain - norain).mean(dim=1, keepdim=True) > 1e-6).float()
-            spatial_weight = 1.0 + 4.0 * mask
-            
-            # Apply spatial weighting to pixel-wise terms (L1) implied in loss
-            # Note: criterion returns scalar, so we approximate by scaling the total loss
-            # Ideally we'd scale L1 map, but scaling total loss is a good proxy for "hard example mining"
-            loss = loss_raw * spatial_weight.mean() # Scale by average difficulty
-            
-            # 2. DWA Update (every 10 iters)
+            with torch.amp.autocast('cuda'):
+                out = model(rain)
+                loss, loss_dict = criterion(out, norain, return_dict=True)
+
+            # DWA Update (every 10 iters)
             if n_iter % 10 == 0 and n_iter > 0:
-                # Collect individual loss values for DWA
-                # [l1, percep, ssim, edge, freq]
                 curr_losses = [
                     loss_dict.get('l1', 0),
                     loss_dict.get('perceptual', 0),
@@ -261,16 +249,18 @@ def train_and_evaluate(args):
                 new_weights = dwa_updater.update(curr_losses)
                 criterion.update_weights({
                     'l1': new_weights[0],
-                    'perceptual': new_weights[1], 
+                    'perceptual': new_weights[1],
                     'ssim': new_weights[2],
                     'edge': new_weights[3],
                     'freq': new_weights[4] if len(new_weights)>4 else 0.0
                 })
-            
-            # Backward
-            loss.backward()
+
+            # Backward with AMP scaling
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             
             iter_time = perf.iter_end()
@@ -301,8 +291,8 @@ def train_and_evaluate(args):
                     **{f'loss_{k}': v for k, v in loss_dict.items()}
                 })
             
-            # ── Validation + Checkpoint (every 500 iters) ──
-            if n_iter > 0 and n_iter % 500 == 0:
+            # ── Validation + Checkpoint ──
+            if n_iter > 0 and n_iter % args.val_every == 0:
                 val_result = validate(model, val_loader, criterion, device)
                 val_history.append({
                     'iteration': n_iter, 
@@ -374,6 +364,9 @@ def train_and_evaluate(args):
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print(f"\n[OOM] Iter {n_iter}: Clearing cache, skipping batch...")
+                if 'out' in dir(): del out
+                if 'rain' in dir(): del rain
+                if 'norain' in dir(): del norain
                 mem.safe_clear()
                 optimizer.zero_grad(set_to_none=True)
                 continue

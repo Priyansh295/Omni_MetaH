@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.amp
 from pytorch_wavelets import DWTForward
 
 
@@ -77,7 +78,9 @@ class WaveFFC(nn.Module):
         global_out = self.global_conv(global_x)
 
         try:
-            LL, _ = self.dwt(x)
+            # DWT does not support float16 — force float32 under AMP
+            with torch.amp.autocast('cuda', enabled=False):
+                LL, _ = self.dwt(x.float())
             gate = self.freq_gate(F.interpolate(LL, size=x.shape[-2:], mode='bilinear', align_corners=False))
         except RuntimeError:
             gate = torch.ones_like(x) * 0.5

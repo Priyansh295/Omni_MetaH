@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import kornia.filters
 
-from .perceptual import VGGPerceptualLoss, HighReceptiveFieldPerceptualLoss
+from .perceptual import VGGPerceptualLoss
 from .frequency import FrequencyAwareLoss, AdaptiveFrequencyLoss
 from .ssim import SSIMLoss
 
@@ -61,7 +61,6 @@ class WaveSSMLoss(nn.Module):
         
         # Initialize sub-losses
         self.perceptual = VGGPerceptualLoss(resize=True)
-        self.hrfpl = HighReceptiveFieldPerceptualLoss() # Optional, can enable via weights
         
         self.ssim = SSIMLoss(window_size=11, sigma=1.5)
         
