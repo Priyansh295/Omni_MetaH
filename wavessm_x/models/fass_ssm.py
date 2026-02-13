@@ -296,14 +296,16 @@ class FrequencyAdaptiveSSM(nn.Module):
         if HAS_MAMBA_CUDA:
             # Fused CUDA kernel — same math, 10-50x faster
             u = x_conv.transpose(1, 2).contiguous()          # (B, d_inner, L)
-            delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous()  # (B, d_inner, L)
-            B_ssm = B.transpose(1, 2).contiguous()            # (B, d_state, L)
-            C_ssm = C.transpose(1, 2).contiguous()            # (B, d_state, L)
-            z_ssm = z.transpose(1, 2).contiguous()            # (B, d_inner, L)
+            # All inputs must share the same dtype (AMP may mix float16/float32)
+            input_dtype = u.dtype
+            delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous().to(input_dtype)
+            B_ssm = B.transpose(1, 2).contiguous().to(input_dtype)
+            C_ssm = C.transpose(1, 2).contiguous().to(input_dtype)
+            z_ssm = z.transpose(1, 2).contiguous().to(input_dtype)
 
             y = selective_scan_fn(
-                u, delta, A, B_ssm, C_ssm,
-                D=self.D, z=z_ssm, delta_softplus=False
+                u, delta, A.to(input_dtype), B_ssm, C_ssm,
+                D=self.D.to(input_dtype), z=z_ssm, delta_softplus=False
             )
             y = y.transpose(1, 2)  # (B, L, d_inner)
         else:
