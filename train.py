@@ -12,6 +12,7 @@ Full training pipeline with:
 import os
 print("DEBUG: Top of train.py", flush=True)
 import time
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -58,15 +59,21 @@ class DWALossUpdater:
         
         r_k = []
         for c, p in zip(curr, prev):
-            p_val = p if p > 1e-8 else 1e-8
+            p_val = max(abs(p), 1e-6)
             r_k.append(c / p_val)
             
         r_k = torch.tensor(r_k).to(device)
+        # Clamp ratios to prevent exp overflow
+        r_k = r_k.clamp(-5.0, 5.0)
         
         # Softmax normalization with temperature
         exp_vals = torch.exp(r_k / self.temp)
         sum_exp = torch.sum(exp_vals)
         self.weights = (exp_vals / sum_exp) * self.num_losses
+        
+        # Final NaN guard
+        if torch.isnan(self.weights).any() or torch.isinf(self.weights).any():
+            self.weights = torch.ones(self.num_losses).to(device)
         
         return self.weights
 
@@ -199,6 +206,9 @@ def train_and_evaluate(args):
             best_val_loss = meta['best_val_loss']
             loss_history = meta['loss_history']
             val_history = meta['val_history']
+            # Restore GradScaler state to avoid recalibration waste
+            if meta.get('extra') and 'scaler_state_dict' in meta['extra']:
+                scaler.load_state_dict(meta['extra']['scaler_state_dict'])
             print(f"  Resumed at iter {start_iter} | Best PSNR: {best_psnr:.2f} | Best SSIM: {best_ssim_val:.4f}")
         else:
             print("No checkpoint found, starting fresh.")
@@ -265,9 +275,11 @@ def train_and_evaluate(args):
             
             iter_time = perf.iter_end()
             
-            # Track
+            # Track (cap history at 5000 to prevent checkpoint bloat)
             loss_val = loss.item()
             loss_history.append(loss_val)
+            if len(loss_history) > 5000:
+                loss_history = loss_history[-5000:]
             metrics.update({'total_loss': loss_val, **loss_dict})
             
             # ── Progress bar (every 10 iters) ──
@@ -303,19 +315,7 @@ def train_and_evaluate(args):
                       f"PSNR: {val_result['psnr']:.2f} | SSIM: {val_result['ssim']:.4f} | "
                       f"{mem.summary()}")
                 
-                # Save config dict for reproducibility
-                config_dict = {k: str(v) for k, v in vars(args).items()}
-                
-                # Save latest checkpoint
-                save_checkpoint(
-                    filepath=checkpoint_path,
-                    model=model, optimizer=optimizer, scheduler=scheduler,
-                    iteration=n_iter, best_psnr=best_psnr, best_ssim=best_ssim_val,
-                    best_val_loss=best_val_loss, loss_history=loss_history,
-                    val_history=val_history, config=config_dict
-                )
-                
-                # Save best checkpoint
+                # Update best metrics FIRST (before saving checkpoint)
                 is_best = False
                 if val_result['psnr'] > best_psnr:
                     best_psnr = val_result['psnr']
@@ -327,6 +327,19 @@ def train_and_evaluate(args):
                     best_val_loss = val_result['val_loss']
                     is_best = True
                 
+                config_dict = {k: str(v) for k, v in vars(args).items()}
+                extra = {'scaler_state_dict': scaler.state_dict()}
+                
+                # Save latest checkpoint (with correct best metrics)
+                save_checkpoint(
+                    filepath=checkpoint_path,
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    iteration=n_iter, best_psnr=best_psnr, best_ssim=best_ssim_val,
+                    best_val_loss=best_val_loss, loss_history=loss_history,
+                    val_history=val_history, config=config_dict, extra=extra
+                )
+                
+                # Save best checkpoint
                 if is_best:
                     best_path = checkpoint_path.replace('.pth', '_best.pth')
                     save_checkpoint(
@@ -334,7 +347,7 @@ def train_and_evaluate(args):
                         model=model, optimizer=optimizer, scheduler=scheduler,
                         iteration=n_iter, best_psnr=best_psnr, best_ssim=best_ssim_val,
                         best_val_loss=best_val_loss, loss_history=loss_history,
-                        val_history=val_history, config=config_dict
+                        val_history=val_history, config=config_dict, extra=extra
                     )
                     print(f"  ★ New best! PSNR={best_psnr:.2f} SSIM={best_ssim_val:.4f}")
                 
@@ -427,15 +440,16 @@ def validate(model, val_loader, criterion, device, max_samples=50):
                 out = model(rain)
                 loss = criterion(out, norain)
             
-            # Skip NaN batches instead of corrupting averages
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
-            
             # Clamp output for metric computation
             out_clamped = out.float().clamp(0, 1)
             norain_clamped = norain.float().clamp(0, 1)
             
-            total_loss += loss.item()
+            loss_val = loss.item()
+            # Skip NaN batches (check on CPU, no extra GPU sync)
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                continue
+            
+            total_loss += loss_val
             total_psnr += psnr(out_clamped, norain_clamped, data_range=1.0).item()
             total_ssim += ssim(out_clamped, norain_clamped, data_range=1.0).item()
             count += 1
