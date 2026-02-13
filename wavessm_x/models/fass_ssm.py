@@ -316,9 +316,8 @@ class FrequencyAdaptiveSSM(nn.Module):
                 D=self.D.float(), z=z_ssm, delta_softplus=False
             )
             y = y.transpose(1, 2)  # (B, L, d_inner)
-            # NaN guard to prevent gradient corruption
-            if torch.isnan(y).any():
-                y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Unconditional NaN/Inf guard — runs on GPU, no sync overhead
+            y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
         else:
             # Fallback: pure PyTorch parallel scan
             dt_expand = dt.unsqueeze(-1).unsqueeze(-1)
