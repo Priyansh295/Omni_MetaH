@@ -104,7 +104,7 @@ class MemoryMonitor:
         """GPU memory utilization as percentage of total."""
         if not torch.cuda.is_available():
             return 0.0
-        total = torch.cuda.get_device_properties(self.device).total_mem
+        total = torch.cuda.get_device_properties(self.device).total_memory
         used = torch.cuda.memory_allocated(self.device)
         return (used / total) * 100.0
     
