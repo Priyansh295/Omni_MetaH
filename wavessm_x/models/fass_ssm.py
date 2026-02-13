@@ -297,14 +297,17 @@ class FrequencyAdaptiveSSM(nn.Module):
             # Fused CUDA kernel — same math, 10-50x faster
             u = x_conv.transpose(1, 2).contiguous()          # (B, d_inner, L)
             # All inputs must share the same dtype (AMP may mix float16/float32)
+            # Cast dt BEFORE expand to avoid dtype issues with expanded views
             input_dtype = u.dtype
-            delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous().to(input_dtype)
+            dt = dt.to(input_dtype)
+            delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous()
+            A_cast = A.to(input_dtype)
             B_ssm = B.transpose(1, 2).contiguous().to(input_dtype)
             C_ssm = C.transpose(1, 2).contiguous().to(input_dtype)
             z_ssm = z.transpose(1, 2).contiguous().to(input_dtype)
 
             y = selective_scan_fn(
-                u, delta, A.to(input_dtype), B_ssm, C_ssm,
+                u, delta, A_cast, B_ssm, C_ssm,
                 D=self.D.to(input_dtype), z=z_ssm, delta_softplus=False
             )
             y = y.transpose(1, 2)  # (B, L, d_inner)
