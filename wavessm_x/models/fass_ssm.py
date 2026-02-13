@@ -301,14 +301,15 @@ class FrequencyAdaptiveSSM(nn.Module):
             input_dtype = u.dtype
             dt = dt.to(input_dtype)
             delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous()
-            A_cast = A.to(input_dtype)
+            # A and D MUST stay float32 (CUDA kernel "weight" requirement)
+            # u, delta, B, C, z can be float16 ("input" type)
             B_ssm = B.transpose(1, 2).contiguous().to(input_dtype)
             C_ssm = C.transpose(1, 2).contiguous().to(input_dtype)
             z_ssm = z.transpose(1, 2).contiguous().to(input_dtype)
 
             y = selective_scan_fn(
-                u, delta, A_cast, B_ssm, C_ssm,
-                D=self.D.to(input_dtype), z=z_ssm, delta_softplus=False
+                u, delta, A, B_ssm, C_ssm,
+                D=self.D, z=z_ssm, delta_softplus=False
             )
             y = y.transpose(1, 2)  # (B, L, d_inner)
         else:
