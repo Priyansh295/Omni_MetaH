@@ -291,25 +291,24 @@ class FrequencyAdaptiveSSM(nn.Module):
 
         dt = dt.clamp(self.dt_min, self.dt_max)
 
-        A = -torch.exp(self.A_log)
+        # A MUST be float32 for CUDA kernel (compute outside autocast influence)
+        A = -torch.exp(self.A_log.float())
 
         if HAS_MAMBA_CUDA:
             # Fused CUDA kernel — same math, 10-50x faster
             u = x_conv.transpose(1, 2).contiguous()          # (B, d_inner, L)
-            # All inputs must share the same dtype (AMP may mix float16/float32)
-            # Cast dt BEFORE expand to avoid dtype issues with expanded views
             input_dtype = u.dtype
+            # delta, B, C, z must match input dtype (float16 under AMP)
             dt = dt.to(input_dtype)
             delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous()
-            # A and D MUST stay float32 (CUDA kernel "weight" requirement)
-            # u, delta, B, C, z can be float16 ("input" type)
             B_ssm = B.transpose(1, 2).contiguous().to(input_dtype)
             C_ssm = C.transpose(1, 2).contiguous().to(input_dtype)
             z_ssm = z.transpose(1, 2).contiguous().to(input_dtype)
 
+            # A and D MUST be float32 (CUDA kernel weight requirement)
             y = selective_scan_fn(
                 u, delta, A, B_ssm, C_ssm,
-                D=self.D, z=z_ssm, delta_softplus=False
+                D=self.D.float(), z=z_ssm, delta_softplus=False
             )
             y = y.transpose(1, 2)  # (B, L, d_inner)
         else:
