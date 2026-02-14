@@ -215,7 +215,8 @@ def train_and_evaluate(args):
         
         if ckpt:
             print(f"Resuming from {ckpt}...")
-            meta = load_checkpoint(ckpt, model, optimizer, scheduler, device)
+            # Don't pass scheduler — we'll rebuild it after to match start_iter
+            meta = load_checkpoint(ckpt, model, optimizer, device=device)
             start_iter = meta['iteration']
             best_psnr = meta['best_psnr']
             best_ssim_val = meta['best_ssim']
@@ -228,7 +229,17 @@ def train_and_evaluate(args):
                 if current_scale < 1.0 or current_scale > 1e10:
                      print(f"  [WARN] Abnormal scale {current_scale}. Creating fresh GradScaler.")
                      scaler = torch.cuda.amp.GradScaler(init_scale=4096.0, enabled=torch.cuda.is_available())
-            print(f"  Resumed at iter {start_iter} | Best PSNR: {best_psnr:.2f} | Best SSIM: {best_ssim_val:.4f}")
+            
+            # Rebuild scheduler and fast-forward to start_iter
+            # This avoids state mismatch from old checkpoint's param group count
+            warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_iters)
+            cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iter - warmup_iters, eta_min=1e-6)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_iters])
+            for _ in range(start_iter):
+                scheduler.step()
+            
+            resumed_lr = optimizer.param_groups[0]['lr']
+            print(f"  Resumed at iter {start_iter} | Best PSNR: {best_psnr:.2f} | Best SSIM: {best_ssim_val:.4f} | LR: {resumed_lr:.2e}")
         else:
             print("No checkpoint found, starting fresh.")
     
