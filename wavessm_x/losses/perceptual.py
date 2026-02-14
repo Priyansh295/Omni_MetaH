@@ -1,119 +1,213 @@
+"""
+Perceptual Loss using VGG19 features
+FIXED: FP32 enforcement to prevent overflow in mixed precision training
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
-from torchvision import models
+from torchvision.models import vgg19, VGG19_Weights
 
 
-class VGGPerceptualLoss(nn.Module):
+class PerceptualLoss(nn.Module):
     """
-    Standard VGG Perceptual Loss (Johnson et al. 2016).
-    Computes L1 distance between features extracted from VGG16.
+    VGG19-based perceptual loss.
     
-    FIX: Entire forward runs in float32 (autocast disabled).
-    VGG deeper layers (relu3_3, relu4_3) produce feature magnitudes
-    that overflow float16 (~65504 max) after ~1-4k training iters.
+    CRITICAL FIX: Entire forward pass runs in FP32 to prevent activation overflow.
+    VGG was trained in FP32 and its intermediate activations can exceed float16 range.
     """
-    def __init__(self, resize=True):
-        super(VGGPerceptualLoss, self).__init__()
-        vgg_features = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1).features.eval()
-        blocks = []
-        blocks.append(vgg_features[:4])
-        blocks.append(vgg_features[4:9])
-        blocks.append(vgg_features[9:16])
-        blocks.append(vgg_features[16:23])
+    def __init__(self, layers=None, weights=None):
+        super().__init__()
         
-        for bl in blocks:
-            for p in bl.parameters():
-                p.requires_grad = False
-                
-        self.blocks = nn.ModuleList(blocks)
-        self.transform = torch.nn.functional.interpolate
-        self.resize = resize
-        self.mean = torch.nn.Parameter(torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1), requires_grad=False)
-        self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1), requires_grad=False)
-
-    def forward(self, input, target):
-        # ── FIX: disable autocast for entire VGG forward ──
+        # Load pre-trained VGG19
+        vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
+        
+        # Default feature extraction layers
+        if layers is None:
+            # Use relu outputs from different depth levels
+            layers = ['relu1_2', 'relu2_2', 'relu3_4', 'relu4_4', 'relu5_4']
+        
+        # Default weights for each layer
+        if weights is None:
+            weights = [1.0 / len(layers)] * len(layers)
+        
+        self.layers = layers
+        self.weights = weights
+        
+        # Build feature extractor
+        self.feature_extractor = self._build_feature_extractor(vgg)
+        
+        # Freeze all parameters (no training)
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+        
+        self.feature_extractor.eval()
+        
+        # VGG normalization (ImageNet stats)
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+    
+    def _build_feature_extractor(self, vgg):
+        """Build feature extractor from VGG19."""
+        # Map layer names to VGG indices
+        layer_map = {
+            'relu1_1': 1,  'relu1_2': 3,
+            'relu2_1': 6,  'relu2_2': 8,
+            'relu3_1': 11, 'relu3_2': 13, 'relu3_3': 15, 'relu3_4': 17,
+            'relu4_1': 20, 'relu4_2': 22, 'relu4_3': 24, 'relu4_4': 26,
+            'relu5_1': 29, 'relu5_2': 31, 'relu5_3': 33, 'relu5_4': 35,
+        }
+        
+        # Get maximum index needed
+        max_idx = max(layer_map[layer] for layer in self.layers)
+        
+        # Extract layers up to max_idx
+        features = nn.Sequential(*list(vgg.features.children())[:max_idx + 1])
+        
+        return features
+    
+    def normalize(self, x):
+        """Normalize input using ImageNet statistics."""
+        return (x - self.mean) / self.std
+    
+    def extract_features(self, x):
+        """Extract features at specified layers."""
+        # Map layer names to VGG indices
+        layer_map = {
+            'relu1_1': 1,  'relu1_2': 3,
+            'relu2_1': 6,  'relu2_2': 8,
+            'relu3_1': 11, 'relu3_2': 13, 'relu3_3': 15, 'relu3_4': 17,
+            'relu4_1': 20, 'relu4_2': 22, 'relu4_3': 24, 'relu4_4': 26,
+            'relu5_1': 29, 'relu5_2': 31, 'relu5_3': 33, 'relu5_4': 35,
+        }
+        
+        features = []
+        for i, layer in enumerate(self.feature_extractor):
+            x = layer(x)
+            # Check if this is one of our target layers
+            for target_layer in self.layers:
+                if layer_map[target_layer] == i:
+                    features.append(x)
+        
+        return features
+    
+    def forward(self, pred, target):
+        """
+        Compute perceptual loss.
+        
+        CRITICAL: Entire computation in FP32 to prevent overflow.
+        
+        Args:
+            pred: Predicted image [B, 3, H, W] in range [0, 1]
+            target: Target image [B, 3, H, W] in range [0, 1]
+        
+        Returns:
+            Perceptual loss (scalar)
+        """
+        # ═══════════════════════════════════════════════════════════
+        # CRITICAL FIX: Force FP32 for entire VGG forward pass
+        # ═══════════════════════════════════════════════════════════
         with torch.amp.autocast('cuda', enabled=False):
-            input = input.float()
+            # Convert to FP32
+            pred = pred.float()
             target = target.float()
             
-            if input.shape[1] != 3:
-                input = input.repeat(1, 3, 1, 1)
-                target = target.repeat(1, 3, 1, 1)
-
-            input = input.clamp(0, 1)
-            target = target.clamp(0, 1)
-
-            input = (input - self.mean) / self.std
-            target = (target - self.mean) / self.std
+            # Normalize using ImageNet stats
+            pred = self.normalize(pred)
+            target = self.normalize(target)
             
-            if self.resize:
-                input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
-                target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
-                
+            # Extract features
+            pred_features = self.extract_features(pred)
+            target_features = self.extract_features(target)
+            
+            # Compute weighted L1 loss across all feature layers
             loss = 0.0
-            x = input
-            y = target
-            for i, block in enumerate(self.blocks):
-                x = block(x)
-                y = block(y)
-                loss += F.l1_loss(x, y)
+            for weight, pred_feat, target_feat in zip(self.weights, pred_features, target_features):
+                loss += weight * F.l1_loss(pred_feat, target_feat)
+        
         return loss
 
 
-class HighReceptiveFieldPerceptualLoss(nn.Module):
+class StyleLoss(nn.Module):
     """
-    High Receptive Field Perceptual Loss (LaMa style).
-    Uses deeper layers of VGG19 (relu5_4) to capture global structure.
+    Style loss using Gram matrices.
+    
+    Can be combined with perceptual loss for style transfer tasks.
+    Also uses FP32 for stability.
     """
-    def __init__(self):
+    def __init__(self, layers=None):
         super().__init__()
-        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
         
-        self.slice1 = torch.nn.Sequential()
-        self.slice2 = torch.nn.Sequential()
-        self.slice3 = torch.nn.Sequential()
-        self.slice4 = torch.nn.Sequential()
-        self.slice5 = torch.nn.Sequential()
+        if layers is None:
+            layers = ['relu2_2', 'relu3_4', 'relu4_4']
         
-        for x in range(2):
-            self.slice1.add_module(str(x), vgg[x])
-        for x in range(2, 7):
-            self.slice2.add_module(str(x), vgg[x])
-        for x in range(7, 12):
-            self.slice3.add_module(str(x), vgg[x])
-        for x in range(12, 21):
-            self.slice4.add_module(str(x), vgg[x])
-        for x in range(21, 30):
-            self.slice5.add_module(str(x), vgg[x])
-            
-        for param in self.parameters():
-            param.requires_grad = False
-            
+        self.perceptual_loss = PerceptualLoss(layers=layers)
+    
+    def gram_matrix(self, x):
+        """Compute Gram matrix (feature correlations)."""
+        B, C, H, W = x.shape
+        features = x.view(B, C, H * W)
+        gram = torch.bmm(features, features.transpose(1, 2))
+        return gram / (C * H * W)
+    
     def forward(self, pred, target):
-        # ── FIX: disable autocast for entire VGG19 forward ──
+        """Compute style loss using Gram matrices."""
         with torch.amp.autocast('cuda', enabled=False):
             pred = pred.float()
             target = target.float()
             
-            mean = torch.tensor([0.485, 0.456, 0.406], device=pred.device).view(1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], device=pred.device).view(1, 3, 1, 1)
+            # Normalize
+            pred = self.perceptual_loss.normalize(pred)
+            target = self.perceptual_loss.normalize(target)
             
-            pred_norm = (pred - mean) / std
-            target_norm = (target - mean) / std
+            # Extract features
+            pred_features = self.perceptual_loss.extract_features(pred)
+            target_features = self.perceptual_loss.extract_features(target)
             
+            # Compute style loss using Gram matrices
             loss = 0.0
-            x_pred = pred_norm
-            x_target = target_norm
-            
-            for i, (slicer, weight) in enumerate(zip(
-                [self.slice1, self.slice2, self.slice3, self.slice4, self.slice5],
-                [1.0/32, 1.0/16, 1.0/8, 1.0/4, 1.0]
-            )):
-                x_pred = slicer(x_pred)
-                x_target = slicer(x_target)
-                loss += weight * F.l1_loss(x_pred, x_target)
-                
+            for pred_feat, target_feat in zip(pred_features, target_features):
+                pred_gram = self.gram_matrix(pred_feat)
+                target_gram = self.gram_matrix(target_feat)
+                loss += F.mse_loss(pred_gram, target_gram)
+        
         return loss
+
+
+# ═══════════════════════════════════════════════════════════
+# Simpler alternative: Use LPIPS if available
+# ═══════════════════════════════════════════════════════════
+try:
+    import lpips
+    
+    class LPIPSLoss(nn.Module):
+        """
+        Learned Perceptual Image Patch Similarity.
+        
+        Often more stable than raw VGG features.
+        """
+        def __init__(self, net='vgg'):
+            super().__init__()
+            self.lpips = lpips.LPIPS(net=net, verbose=False)
+            self.lpips.eval()
+            for param in self.lpips.parameters():
+                param.requires_grad = False
+        
+        def forward(self, pred, target):
+            """
+            Compute LPIPS loss.
+            
+            Args:
+                pred, target: Images in range [0, 1]
+            
+            Returns:
+                LPIPS distance (lower is better)
+            """
+            with torch.amp.autocast('cuda', enabled=False):
+                # LPIPS expects range [-1, 1]
+                pred = pred.float() * 2.0 - 1.0
+                target = target.float() * 2.0 - 1.0
+                return self.lpips(pred, target).mean()
+
+except ImportError:
+    # LPIPS not available, use VGG-based loss
+    pass
