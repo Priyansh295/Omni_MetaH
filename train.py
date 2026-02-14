@@ -397,10 +397,15 @@ def train_and_evaluate(args):
             if n_iter < 1000:
                 criterion.update_weights({'l1': 1.0, 'perceptual': 0.0, 'ssim': 0.0, 'edge': 0.0, 'freq': 0.0})
             elif n_iter < 3000:
-                criterion.update_weights({'l1': 1.0, 'perceptual': 0.1, 'ssim': 0.1, 'edge': 0.0, 'freq': 0.0})
+                # FIX: Smooth ramp-up for perceptual/ssim instead of hard jump
+                # START at 0.01 to "wake up" the gradients gently
+                t = (n_iter - 1000) / 2000.0
+                p_w = 0.01 + t * 0.09  # 0.01 -> 0.1
+                s_w = 0.01 + t * 0.09  # 0.01 -> 0.1
+                criterion.update_weights({'l1': 1.0, 'perceptual': p_w, 'ssim': s_w, 'edge': 0.0, 'freq': 0.0})
             elif n_iter < 5000:
-                # Ramp up gradually
-                t = (n_iter - 3000) / 2000.0  # 0 -> 1 over iter 3k-5k
+                # Ramp up from 0.1 to full_weights
+                t = (n_iter - 3000) / 2000.0
                 criterion.update_weights({
                     'l1': full_weights['l1'],
                     'perceptual': 0.1 + t * (full_weights['perceptual'] - 0.1),
@@ -409,7 +414,6 @@ def train_and_evaluate(args):
                     'freq': t * full_weights['freq']
                 })
             else:
-                # ── FIX: restore full weights from config after warmup ──
                 criterion.update_weights(full_weights)
 
             optimizer.zero_grad(set_to_none=True)
@@ -442,18 +446,23 @@ def train_and_evaluate(args):
             scaler.unscale_(optimizer)
 
             # ═══════════════════════════════════════════════════════════
-            # FIX 5: Enhanced gradient clipping (reduced from 1.0 to 0.5 for more stability)
+            # FIX 5b: Tighter gradient clipping (0.25) - User's v2 Setting
             # ═══════════════════════════════════════════════════════════
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
             
             if not torch.isfinite(grad_norm):
-                print(f"[NaN GRAD] iter {n_iter}: grad_norm={grad_norm:.2f}, skipping step")
+                print(f"[NaN GRAD] iter {n_iter}: grad_norm={grad_norm}, skipping step")
                 optimizer.zero_grad(set_to_none=True)
                 scaler.update()
                 continue
 
             scaler.step(optimizer)
             scaler.update()
+            
+            # Prevent scale from vanishing
+            if scaler.get_scale() < 1e-4:
+                 scaler.update(new_scale=4096.0)
+
             scheduler.step()
             
             iter_time = perf.iter_end()
