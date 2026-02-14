@@ -225,8 +225,8 @@ def train_and_evaluate(args):
                 scaler.load_state_dict(meta['extra']['scaler_state_dict'])
                 current_scale = scaler.get_scale()
                 if current_scale < 1.0 or current_scale > 1e10:
-                     print(f"  [WARN] Abnormal scale {current_scale}. Resetting to 4096.")
-                     scaler._scale = torch.tensor(4096.0).to(device)
+                     print(f"  [WARN] Abnormal scale {current_scale}. Creating fresh GradScaler.")
+                     scaler = torch.cuda.amp.GradScaler(init_scale=4096.0, enabled=torch.cuda.is_available())
             print(f"  Resumed at iter {start_iter} | Best PSNR: {best_psnr:.2f} | Best SSIM: {best_ssim_val:.4f}")
         else:
             print("No checkpoint found, starting fresh.")
