@@ -42,6 +42,10 @@ def ssim(img1, img2, window_size=11, sigma=1.5, size_average=True, window=None):
     numerator = (2*mu1_mu2 + C1) * (2*sigma12 + C2)
     denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
     ssim_map = numerator / (denominator + eps)
+    
+    # Final guard against NaN/Inf
+    ssim_map = torch.nan_to_num(ssim_map, nan=0.0, posinf=1.0, neginf=0.0)
+    ssim_map = ssim_map.clamp(0, 1)
 
     if size_average:
         return ssim_map.mean()

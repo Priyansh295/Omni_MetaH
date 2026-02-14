@@ -27,7 +27,7 @@ def parse_args():
     # Training arguments
     parser.add_argument('--num_iter', type=int, default=100000, help='Total training iterations')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
     parser.add_argument('--workers', type=int, default=4, help='Data loader workers')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')

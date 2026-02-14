@@ -19,17 +19,29 @@ class SpectralTransform(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
+        orig_dtype = x.dtype
 
-        x_fft = torch.fft.rfft2(x, norm='ortho')
-        x_fft = torch.cat([x_fft.real, x_fft.imag], dim=1)
+        # Force FP32 for FFT stability
+        with torch.cuda.amp.autocast(enabled=False):
+            x_f = x.float()
+            x_fft = torch.fft.rfft2(x_f, norm='ortho')
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=1)
 
+            # Process in FP32 or cast back for conv?
+            # Usually Conv/BN/ReLU are fine in FP16, but FFT output is sensitive.
+            # Let's cast back to orig_dtype for Conv block to save memory, 
+            # then cast to FP32 for IFFT.
+            x_fft = x_fft.to(orig_dtype)
+            
         x_fft = self.relu(self.bn(self.conv(x_fft)))
 
-        real, imag = x_fft.chunk(2, dim=1)
-        x_fft = torch.complex(real, imag)
-        x = torch.fft.irfft2(x_fft, s=(H, W), norm='ortho')
-
-        return x
+        with torch.cuda.amp.autocast(enabled=False):
+            x_fft = x_fft.float()
+            real, imag = x_fft.chunk(2, dim=1)
+            x_fft_complex = torch.complex(real, imag)
+            x = torch.fft.irfft2(x_fft_complex, s=(H, W), norm='ortho')
+            
+        return x.to(orig_dtype)
 
 
 class WaveFFC(nn.Module):

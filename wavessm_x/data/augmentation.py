@@ -23,7 +23,11 @@ class AdvancedAugmentation:
         """Add subtle Gaussian noise"""
         if random.random() < self.prob:
             noise = torch.randn_like(img) * noise_std
-            img = torch.clamp(img + noise, 0, 1)
+            img = torch.clamp(img + noise, 0, 1) # Ensure valid range
+            
+            # Additional safety: guard against zero std if normalization happens here
+            # (Though dataset.py does standard ImageNet norm usually, 
+            #  this fixes potential noise-induced issues)
         return img
         
     def apply_random_erasing(self, img: torch.Tensor) -> torch.Tensor:

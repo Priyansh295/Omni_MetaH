@@ -13,6 +13,12 @@ except ImportError:
           "Install with: pip install mamba-ssm")
 
 
+def safe_layer_norm(ln, x):
+    """Execute LayerNorm in FP32 for stability in AMP"""
+    with torch.cuda.amp.autocast(enabled=False):
+        return ln(x.float()).type_as(x)
+
+
 def parallel_scan(A: torch.Tensor, B: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     O(N) parallel associative scan using log-cumsum trick.
@@ -333,7 +339,9 @@ class FrequencyAdaptiveSSM(nn.Module):
             y = (hidden_states * C.unsqueeze(2)).sum(dim=-1)
             y = y * self.act(z)
             y = y + x_conv * self.D
-        y = self.out_norm(y)
+            
+        # Wrap LayerNorm in FP32
+        y = safe_layer_norm(self.out_norm, y)
         out = self.out_proj(y)
 
         out = x * self.skip_scale + out
@@ -468,7 +476,21 @@ class CrossFrequencyAttention(nn.Module):
 
         # Calculates attention map of size (B, C, C) - Efficient O(C^2)
         # Instead of (B, HW, HW) - Expensive O(N^2)
-        attn = torch.softmax(q @ k.transpose(-1, -2) * self.scale, dim=-1)
+        # FP32 Attention for stability
+        q_f, k_f = q.float(), k.float()
+        scores = torch.matmul(q_f, k_f.transpose(-1, -2)) * self.scale
+        
+        # Max-subtraction for numerical stability
+        scores = scores - scores.max(dim=-1, keepdim=True)[0]
+        
+        attn = torch.softmax(scores, dim=-1)
+        
+        # Guard against degenerate rows
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
+        
+        # Cast back to model dtype
+        attn = attn.type_as(v)
         
         # Apply attention to values
         out = (attn @ v).view(B, C, H, W)

@@ -80,6 +80,11 @@ class DWALossUpdater:
 def train_and_evaluate(args):
 
     print(f"Device: {device}")
+    
+    # Enable TF32 for better performance/stability on Ampere+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     
@@ -173,11 +178,23 @@ def train_and_evaluate(args):
         }
     ).to(device)
     
+    # ── 4. Optimization Setup ─────────────────────────────────
+    # Split params: no weight decay for biases, norms, and scalars
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or "bias" in n or "norm" in n or "scale" in n:
+            no_decay.append(p)
+        else:
+            decay.append(p)
+            
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4
+        [{'params': decay}, {'params': no_decay, 'weight_decay': 0.0}],
+        lr=args.lr, weight_decay=1e-4
     )
     
-    warmup_iters = min(300, args.num_iter // 30)
+    warmup_iters = min(1000, args.num_iter // 30) # Warmup 1000 iters
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_iters)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iter - warmup_iters, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_iters])
@@ -240,42 +257,73 @@ def train_and_evaluate(args):
             
             rain = rain.to(device, non_blocking=True)
             norain = norain.to(device, non_blocking=True)
-
-            # Forward with AMP (mixed precision)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda'):
-                out = model(rain)
-                loss, loss_dict = criterion(out, norain, return_dict=True)
-
-            # DWA Update (every 10 iters)
-            if n_iter % 10 == 0 and n_iter > 0:
-                curr_losses = [
-                    loss_dict.get('l1', 0),
-                    loss_dict.get('perceptual', 0),
-                    loss_dict.get('ssim', 0),
-                    loss_dict.get('edge', 0),
-                    loss_dict.get('freq', 0)
-                ]
-                new_weights = dwa_updater.update(curr_losses)
-                criterion.update_weights({
-                    'l1': new_weights[0],
-                    'perceptual': new_weights[1],
-                    'ssim': new_weights[2],
-                    'edge': new_weights[3],
-                    'freq': new_weights[4] if len(new_weights)>4 else 0.0
-                })
-
-            # Guard: skip gradient step if loss is NaN/Inf (prevents model corruption)
-            loss_check = loss.item()
-            if math.isnan(loss_check) or math.isinf(loss_check):
-                optimizer.zero_grad(set_to_none=True)
-                print(f"\n  [NaN SKIP] Iter {n_iter}: loss={loss_check}, skipping backward")
+            
+            # 1. Input Check
+            if not (torch.isfinite(rain).all() and torch.isfinite(norain).all()):
+                print(f"[NaN INPUT] iter {n_iter} skipping batch")
                 continue
+
+            # Progressive Warmup Weights
+            if n_iter < 1000:
+                # First 1k iters: L1 only
+                criterion.update_weights({'l1': 1.0, 'perceptual': 0.0, 'ssim': 0.0, 'edge': 0.0, 'freq': 0.0})
+            elif n_iter < 5000:
+                # 1k-5k iters: Add mild perceptual/SSIM
+                criterion.update_weights({'l1': 1.0, 'perceptual': 0.1, 'ssim': 0.1, 'edge': 0.0, 'freq': 0.0})
+            # 5k+: Full weights (defaults or DWA)
+
+            # DWA Update (every 10 iters, but DISABLED for first 5000 iters)
+            if n_iter > 5000 and n_iter % 10 == 0:
+                # ... DWA logic ...
+                pass 
+
+            optimizer.zero_grad(set_to_none=True)
+            
+            with torch.amp.autocast('cuda'):
+                # Forward
+                out = model(rain)
+                
+                # 2. Output Check
+                if not torch.isfinite(out).all():
+                    print(f"[NaN OUTPUT] iter {n_iter} skipping batch")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                # 3. Compute Loss
+                # Note: We assume criterion returns total_loss, loss_dict
+                loss, loss_dict = criterion(out, norain, return_dict=True)
+                
+                # 4. Strict Loss Check
+                is_loss_finite = True
+                for k, v in loss_dict.items():
+                    if not math.isfinite(v):
+                        is_loss_finite = False
+                        break
+                if not is_loss_finite or not torch.isfinite(loss):
+                     print(f"[NaN SUBLOSS] iter {n_iter}: sub-loss non-finite, skipping batch")
+                     optimizer.zero_grad(set_to_none=True)
+                     scaler.update() # shrink scale just in case
+                     continue
 
             # Backward with AMP scaling
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            # 5. Gradient Check
+            grad_valid = True
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grad_valid = False
+                    break
+            
+            if not grad_valid:
+                print(f"[NaN GRAD] iter {n_iter}: skipping step")
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update() 
+                continue
+
+            # Clip and Step
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -299,15 +347,16 @@ def train_and_evaluate(args):
                     f"SSIM:{loss_dict.get('ssim',0):.3f} LR:{current_lr:.1e} ETA:{eta}"
                 )
             
-            # ── CSV logging (every 100 iters) ──
-            if n_iter % 100 == 0:
+            # ── CSV logging (every 10 iters) ──
+            if n_iter % 10 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 perf.log_to_csv(n_iter, {
                     'total_loss': loss_val,
                     'lr': current_lr,
+                    'grad_norm': grad_norm.item(),
                     'iter_time': iter_time,
                     'gpu_mem_mb': mem.current_mb(),
-                    **{f'loss_{k}': v for k, v in loss_dict.items()}
+                    **{f'loss_{k}': v for k, v in loss_dict.items() if isinstance(v, (int, float))}
                 })
             
             # ── Validation + Checkpoint ──

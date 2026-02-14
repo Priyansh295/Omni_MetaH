@@ -71,9 +71,17 @@ class Attention(nn.Module):
         return spatial_attention
 
     def get_kernel_attention(self, x):
-        kernel_attention = self.kernel_fc(x).view(x.size(0), -1, 1, 1, 1, 1)
-        kernel_attention = F.softmax(kernel_attention / self.temperature, dim=1)
-        return kernel_attention
+        k_attn = self.kernel_fc(x).view(x.size(0), -1, 1, 1, 1, 1)
+        
+        # FP32 Attention + Max-subtraction
+        k_attn_f = k_attn.float()
+        k_attn_f = k_attn_f - k_attn_f.max(dim=1, keepdim=True)[0]
+        
+        k_attn = F.softmax(k_attn_f / self.temperature, dim=1)
+        k_attn = torch.nan_to_num(k_attn, nan=0.0)
+        
+        # Cast back
+        return k_attn.type_as(x)
 
     def forward(self, x):
         x = self.avgpool(x)

@@ -41,6 +41,13 @@ def save_checkpoint(
         config: Training config dict for reproducibility
         extra: Any additional state to save
     """
+    
+    # Safety Check: Scan for NaNs in model state
+    for k, v in model.state_dict().items():
+        if isinstance(v, torch.Tensor) and not torch.isfinite(v).all():
+             print(f"[FATAL] Checkpoint save aborted! Model corrupted at key: {k}")
+             return # Abort save to protect previous checkpoint
+             
     os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
     
     state = {
