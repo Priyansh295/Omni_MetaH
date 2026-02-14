@@ -348,18 +348,6 @@ def train_and_evaluate(args):
     print(f"  Visualizations: {vis_dir}")
     print()
     
-    # ═══════════════════════════════════════════════════════════
-    # FIX 8: Strict Pre-Training Health Check
-    # ═══════════════════════════════════════════════════════════
-    print("Pre-training model health check...")
-    is_healthy, issues = check_model_health(model, check_weights=True)
-    if not is_healthy:
-        print(f"[FATAL] Model unhealthy before training: {issues}")
-        # If we are resuming, this is bad. If fresh, this is impossible unless init is broken.
-        # We'll assert here to stop.
-        raise RuntimeError(f"Model unhealthy before training: {issues}")
-    print("  Model health: OK\n")
-
     model.train()
     iter_train_loader = iter(train_loader)
     metrics = MetricsTracker()

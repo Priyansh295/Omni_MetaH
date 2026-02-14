@@ -76,24 +76,29 @@ class WaveFFC(nn.Module):
         self.fusion = nn.Conv2d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        local_x = x[:, :self.local_ch, :, :]
-        global_x = x[:, self.local_ch:, :, :]
-
-        local_out = self.local_conv(local_x)
-        global_out = self.global_conv(global_x)
-
-        try:
-            with torch.amp.autocast('cuda', enabled=False):
-                LL, _ = self.dwt(x.float())
-            gate = self.freq_gate(F.interpolate(LL, size=x.shape[-2:], mode='bilinear', align_corners=False))
-            gate = gate.to(x.dtype)
-        except RuntimeError:
-            gate = torch.ones(x.shape, device=x.device, dtype=x.dtype) * 0.5
-
-        out = torch.cat([local_out, global_out], dim=1)
-        out = self.fusion(out * gate) + x
-
-        return out
+        # P3 Fix: Force entire WaveFFC block to float32
+        # This protects internal BatchNorms (local_conv, freq_gate) from overflow
+        with torch.amp.autocast('cuda', enabled=False):
+            x = x.float()
+            
+            local_x = x[:, :self.local_ch, :, :]
+            global_x = x[:, self.local_ch:, :, :]
+    
+            local_out = self.local_conv(local_x)
+            global_out = self.global_conv(global_x)
+    
+            try:
+                LL, _ = self.dwt(x) # x is already float32
+                # Interpolate LL to match x size for gating
+                gate = self.freq_gate(F.interpolate(LL, size=x.shape[-2:], mode='bilinear', align_corners=False))
+            except RuntimeError:
+                # Fallback if DWT fails (e.g. too small input)
+                gate = torch.ones(x.shape, device=x.device, dtype=x.dtype) * 0.5
+    
+            out = torch.cat([local_out, global_out], dim=1)
+            out = self.fusion(out * gate) + x
+    
+            return out
 
 
 class WaveFFCBlock(nn.Module):

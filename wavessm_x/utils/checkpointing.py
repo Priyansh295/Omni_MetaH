@@ -84,8 +84,35 @@ def load_checkpoint(
     map_location = device or torch.device('cpu')
     checkpoint = torch.load(filepath, map_location=map_location, weights_only=False)
     
+    # ── SNAPSHOT SANITIZER ──
+    # Working on a copy to avoid side-effects
+    model_state = checkpoint['model_state_dict'].copy()
+    sanitized_keys = []
+    
+    for k, v in model_state.items():
+        if torch.is_tensor(v) and not torch.isfinite(v).all():
+            # benign stats -> reset
+            if 'running_mean' in k:
+                print(f"  [WARN] Resetting corrupted running_mean: {k}")
+                model_state[k] = torch.zeros_like(v)
+                sanitized_keys.append(k)
+            elif 'running_var' in k:
+                print(f"  [WARN] Resetting corrupted running_var: {k}")
+                model_state[k] = torch.ones_like(v)
+                sanitized_keys.append(k)
+            elif 'num_batches_tracked' in k:
+                model_state[k] = torch.tensor(0, dtype=torch.long, device=v.device)
+                sanitized_keys.append(k)
+            else:
+                # weight/bias -> FATAL
+                print(f"  [CRITICAL] NaN/Inf found in learnable parameter: {k}")
+                raise RuntimeError(f"Checkpoint contains corrupted weights ({k}). Cannot resume.")
+    
+    if sanitized_keys:
+        print(f"  Sanitized {len(sanitized_keys)} corrupted BatchNorm statistics.")
+
     # Model
-    model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+    model.load_state_dict(model_state, strict=strict)
     
     # Optimizer — catch param group mismatch
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
@@ -99,20 +126,19 @@ def load_checkpoint(
     if scheduler is not None and 'scheduler_state_dict' in checkpoint:
         try:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        except Exception as e:
+        except ValueError as e:
              print(f"  [WARN] Scheduler state mismatch: {e}")
-             print("  Skipping scheduler load. Starting with fresh scheduler.")
+             print("  Skipping scheduler load. Starting with fresh scheduler state.")
     
     meta = {
         'iteration': checkpoint.get('iteration', 0),
-        'epoch': checkpoint.get('epoch', 0),
         'best_psnr': checkpoint.get('best_psnr', 0.0),
         'best_ssim': checkpoint.get('best_ssim', 0.0),
         'best_val_loss': checkpoint.get('best_val_loss', float('inf')),
         'loss_history': checkpoint.get('loss_history', []),
         'val_history': checkpoint.get('val_history', []),
         'config': checkpoint.get('config', None),
-        'extra': checkpoint.get('extra', None),
+        'extra': checkpoint.get('extra', {}),
         'timestamp': checkpoint.get('timestamp', 'unknown'),
     }
     
