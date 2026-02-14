@@ -32,28 +32,33 @@ class VGGPerceptualLoss(nn.Module):
         self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1), requires_grad=False)
 
     def forward(self, input, target):
-        if input.shape[1] != 3:
-            input = input.repeat(1, 3, 1, 1)
-            target = target.repeat(1, 3, 1, 1)
-
-        # Clamp to valid range to prevent normalization overflow
-        input = input.clamp(0, 1)
-        target = target.clamp(0, 1)
-
-        input = (input-self.mean) / self.std
-        target = (target-self.mean) / self.std
-        
-        if self.resize:
-            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
-            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
-            
         loss = 0.0
-        x = input
-        y = target
-        for i, block in enumerate(self.blocks):
-            x = block(x)
-            y = block(y)
-            loss += torch.nn.functional.l1_loss(x, y)
+        # P0 Fix: Run VGG in float32 to prevent feature overflow (~65504)
+        with torch.amp.autocast('cuda', enabled=False):
+            input = input.float()
+            target = target.float()
+            
+            if input.shape[1] != 3:
+                input = input.repeat(1, 3, 1, 1)
+                target = target.repeat(1, 3, 1, 1)
+
+            # Clamp to valid range to prevent normalization overflow
+            input = input.clamp(0, 1)
+            target = target.clamp(0, 1)
+
+            input = (input-self.mean) / self.std
+            target = (target-self.mean) / self.std
+            
+            if self.resize:
+                input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
+                target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+                
+            x = input
+            y = target
+            for i, block in enumerate(self.blocks):
+                x = block(x)
+                y = block(y)
+                loss += torch.nn.functional.l1_loss(x, y)
         return loss
 
 

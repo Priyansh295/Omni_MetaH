@@ -21,22 +21,19 @@ class SpectralTransform(nn.Module):
         B, C, H, W = x.shape
         orig_dtype = x.dtype
 
-        # Force FP32 for FFT stability
+        # Force FP32 for entire FFT-Conv-IFFT block stability
+        # FFT coefficients (especially DC/Low-Freq) can exceed FP16 limits
         with torch.cuda.amp.autocast(enabled=False):
             x_f = x.float()
             x_fft = torch.fft.rfft2(x_f, norm='ortho')
             x_fft = torch.cat([x_fft.real, x_fft.imag], dim=1)
 
-            # Process in FP32 or cast back for conv?
-            # Usually Conv/BN/ReLU are fine in FP16, but FFT output is sensitive.
-            # Let's cast back to orig_dtype for Conv block to save memory, 
-            # then cast to FP32 for IFFT.
-            x_fft = x_fft.to(orig_dtype)
-            
-        x_fft = self.relu(self.bn(self.conv(x_fft)))
+            # Conv-BN-ReLU stays in FP32
+            x_fft = self.conv(x_fft)
+            x_fft = self.bn(x_fft)
+            x_fft = self.relu(x_fft)
 
-        with torch.cuda.amp.autocast(enabled=False):
-            x_fft = x_fft.float()
+            # IFFT also in FP32
             real, imag = x_fft.chunk(2, dim=1)
             x_fft_complex = torch.complex(real, imag)
             x = torch.fft.irfft2(x_fft_complex, s=(H, W), norm='ortho')

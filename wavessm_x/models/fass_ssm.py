@@ -309,19 +309,22 @@ class FrequencyAdaptiveSSM(nn.Module):
             # Fused CUDA kernel — same math, 10-50x faster
             u = x_conv.transpose(1, 2).contiguous()          # (B, d_inner, L)
             input_dtype = u.dtype
-            # delta, B, C, z must match input dtype (float16 under AMP)
-            dt = dt.to(input_dtype)
-            delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous()
-            B_ssm = B.transpose(1, 2).contiguous().to(input_dtype)
-            C_ssm = C.transpose(1, 2).contiguous().to(input_dtype)
-            z_ssm = z.transpose(1, 2).contiguous().to(input_dtype)
+            
+            # P0 Fix: Force float32 inputs for selective_scan kernel to prevent overflow
+            # The kernel internal accumulation is safer when inputs are float32
+            u_f = u.float()
+            dt_f = dt.float()
+            delta_f = dt_f.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous()
+            B_f = B.transpose(1, 2).contiguous().float()
+            C_f = C.transpose(1, 2).contiguous().float()
+            z_f = z.transpose(1, 2).contiguous().float()
 
-            # A and D MUST be float32 (CUDA kernel weight requirement)
+            # A is already float32 from log conversion
             y = selective_scan_fn(
-                u, delta, A, B_ssm, C_ssm,
-                D=self.D.float(), z=z_ssm, delta_softplus=False
+                u_f, delta_f, A, B_f, C_f,
+                D=self.D.float(), z=z_f, delta_softplus=False
             )
-            y = y.transpose(1, 2)  # (B, L, d_inner)
+            y = y.to(input_dtype).transpose(1, 2)  # Cast back and transpose
             # Unconditional NaN/Inf guard — runs on GPU, no sync overhead
             y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
         else:

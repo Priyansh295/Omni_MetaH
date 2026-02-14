@@ -62,9 +62,14 @@ class SSIMLoss(torch.nn.Module):
         self._cached_channels = 0
 
     def forward(self, img1, img2):
+        # P1 Fix: SSIM calculation must be float32 to prevent precision loss
+        img1 = img1.float()
+        img2 = img2.float()
+        
         channel = img1.size(1)
         if self._cached_window is None or self._cached_channels != channel:
             self._cached_window = create_window(self.window_size, channel, self.sigma)
             self._cached_channels = channel
-        window = self._cached_window.to(img1.device).type(img1.dtype)
+        # Ensure window is float32
+        window = self._cached_window.to(img1.device).float()
         return 1 - ssim(img1, img2, self.window_size, self.sigma, window=window)

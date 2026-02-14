@@ -21,17 +21,18 @@ class FrequencyAwareLoss(nn.Module):
         loss = 0.0
         
         # DWT does not support float16 — force float32 under AMP
+        # P1 Fix: strict float32 for both DWT and Loss computation to prevent overflow
         with torch.amp.autocast('cuda', enabled=False):
             pl, ph = self.dwt(pred.float())
             tl, th = self.dwt(target.float())
         
-        # LL Loss
-        loss += self.loss_fn(pl, tl) * self.weights.get('LL', 1.0)
-        
-        # HF Loss
-        for i in range(self.levels):
-            # ph[i] is (B, C, 3, H, W) for LH, HL, HH
-            loss += self.loss_fn(ph[i], th[i]) * self.weights.get('HF', 1.5)
+            # LL Loss
+            loss += self.loss_fn(pl, tl) * self.weights.get('LL', 1.0)
+            
+            # HF Loss
+            for i in range(self.levels):
+                # ph[i] is (B, C, 3, H, W) for LH, HL, HH
+                loss += self.loss_fn(ph[i], th[i]) * self.weights.get('HF', 1.5)
             
         return loss
 

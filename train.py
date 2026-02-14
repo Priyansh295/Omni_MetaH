@@ -277,7 +277,15 @@ def train_and_evaluate(args):
             elif n_iter < 5000:
                 # 1k-5k iters: Add mild perceptual/SSIM
                 criterion.update_weights({'l1': 1.0, 'perceptual': 0.1, 'ssim': 0.1, 'edge': 0.0, 'freq': 0.0})
-            # 5k+: Full weights (defaults or DWA)
+            else:
+                # 5k+: Restore full weights from config
+                criterion.update_weights({
+                    'l1': args.loss_weights[0],
+                    'perceptual': args.loss_weights[1],
+                    'ssim': args.loss_weights[2],
+                    'edge': args.loss_weights[3],
+                    'freq': args.loss_weights[4]
+                })
 
             # DWA Update (every 10 iters, but DISABLED for first 5000 iters)
             if n_iter > 5000 and n_iter % 10 == 0:
