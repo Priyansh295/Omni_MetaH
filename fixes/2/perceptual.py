@@ -176,10 +176,6 @@ class StyleLoss(nn.Module):
 # ═══════════════════════════════════════════════════════════
 # Simpler alternative: Use LPIPS if available
 # ═══════════════════════════════════════════════════════════
-
-# Alias for backward compatibility
-VGGPerceptualLoss = PerceptualLoss
-
 try:
     import lpips
     
