@@ -265,6 +265,13 @@ def train_and_evaluate(args):
                     'freq': new_weights[4] if len(new_weights)>4 else 0.0
                 })
 
+            # Guard: skip gradient step if loss is NaN/Inf (prevents model corruption)
+            loss_check = loss.item()
+            if math.isnan(loss_check) or math.isinf(loss_check):
+                optimizer.zero_grad(set_to_none=True)
+                print(f"\n  [NaN SKIP] Iter {n_iter}: loss={loss_check}, skipping backward")
+                continue
+
             # Backward with AMP scaling
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
