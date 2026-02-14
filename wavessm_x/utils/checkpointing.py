@@ -114,12 +114,21 @@ def load_checkpoint(
     model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
     
     # Optimizer
+    # Optimizer
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except ValueError as e:
+            print(f"  [WARN] Optimizer state mismatch (likely new param groups): {e}")
+            print("  Skipping optimizer load. Starting with fresh optimizer state.")
     
     # Scheduler
     if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except Exception as e:
+             print(f"  [WARN] Scheduler state mismatch: {e}")
+             print("  Skipping scheduler load. Starting with fresh scheduler.")
     
     meta = {
         'iteration': checkpoint.get('iteration', 0),
