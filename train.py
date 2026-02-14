@@ -79,6 +79,7 @@ class DWALossUpdater:
         return self.weights
 
 def train_and_evaluate(args):
+    global scaler
 
     print(f"Device: {device}")
     
