@@ -23,30 +23,13 @@ def save_checkpoint(
     config: dict = None,
     extra: dict = None
 ):
-    """
-    Save a full training checkpoint.
-    
-    Args:
-        filepath: Where to save (.pth)
-        model: The model
-        optimizer: The optimizer
-        scheduler: LR scheduler (optional)
-        iteration: Current training iteration
-        epoch: Current epoch
-        best_psnr: Best validation PSNR so far
-        best_ssim: Best validation SSIM so far
-        best_val_loss: Best validation loss so far
-        loss_history: List of training loss values
-        val_history: List of validation metric dicts
-        config: Training config dict for reproducibility
-        extra: Any additional state to save
-    """
+    """Save a full training checkpoint."""
     
     # Safety Check: Scan for NaNs in model state
     for k, v in model.state_dict().items():
         if isinstance(v, torch.Tensor) and not torch.isfinite(v).all():
              print(f"[FATAL] Checkpoint save aborted! Model corrupted at key: {k}")
-             return # Abort save to protect previous checkpoint
+             return
              
     os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
     
@@ -72,7 +55,7 @@ def save_checkpoint(
     if extra is not None:
         state['extra'] = extra
     
-    # Save to a temp file first, then rename for atomicity
+    # Atomic save: write to temp, then rename
     tmp_path = filepath + '.tmp'
     torch.save(state, tmp_path)
     if os.path.exists(filepath):
@@ -92,17 +75,8 @@ def load_checkpoint(
     """
     Load a training checkpoint and restore all state.
     
-    Args:
-        filepath: Path to checkpoint .pth
-        model: Model to load weights into
-        optimizer: Optimizer to restore state (optional)
-        scheduler: LR scheduler to restore (optional)
-        device: Device to map tensors to
-        strict: Whether to strictly enforce state_dict key matching
-    
-    Returns:
-        Dict with restored metadata: iteration, best_psnr, best_ssim, 
-        best_val_loss, loss_history, val_history, config, extra
+    FIX: Gracefully handles optimizer param group mismatch (e.g. switching
+    from 1 param group to decay/no_decay split) and scheduler mismatches.
     """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Checkpoint not found: {filepath}")
@@ -113,8 +87,7 @@ def load_checkpoint(
     # Model
     model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
     
-    # Optimizer
-    # Optimizer
+    # Optimizer — catch param group mismatch
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -122,7 +95,7 @@ def load_checkpoint(
             print(f"  [WARN] Optimizer state mismatch (likely new param groups): {e}")
             print("  Skipping optimizer load. Starting with fresh optimizer state.")
     
-    # Scheduler
+    # Scheduler — catch any mismatch
     if scheduler is not None and 'scheduler_state_dict' in checkpoint:
         try:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -147,12 +120,7 @@ def load_checkpoint(
 
 
 def find_latest_checkpoint(checkpoint_dir: str, prefix: str = 'wavessm_x') -> str:
-    """
-    Find the most recent checkpoint file in a directory.
-    
-    Returns:
-        Path to latest checkpoint, or None if none found.
-    """
+    """Find the most recent checkpoint file in a directory."""
     if not os.path.isdir(checkpoint_dir):
         return None
     
@@ -165,5 +133,4 @@ def find_latest_checkpoint(checkpoint_dir: str, prefix: str = 'wavessm_x') -> st
     if not candidates:
         return None
     
-    # Return most recently modified
     return max(candidates, key=os.path.getmtime)

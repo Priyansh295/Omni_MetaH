@@ -42,7 +42,8 @@ scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
 
 class DWALossUpdater:
-    def __init__(self, num_losses=4, temp=2.0):
+    """Dynamic Weight Averaging for multi-task loss balancing."""
+    def __init__(self, num_losses=5, temp=2.0):
         self.num_losses = num_losses
         self.temp = temp
         self.loss_history = [] 
@@ -53,7 +54,6 @@ class DWALossUpdater:
         if len(self.loss_history) < 3:
             return self.weights
             
-        # Calculate relative training rate r_k = L_k(t) / L_k(t-1)
         prev = self.loss_history[-2]
         curr = self.loss_history[-1]
         
@@ -63,17 +63,18 @@ class DWALossUpdater:
             r_k.append(c / p_val)
             
         r_k = torch.tensor(r_k).to(device)
-        # Clamp ratios to prevent exp overflow
         r_k = r_k.clamp(-5.0, 5.0)
         
-        # Softmax normalization with temperature
         exp_vals = torch.exp(r_k / self.temp)
         sum_exp = torch.sum(exp_vals)
         self.weights = (exp_vals / sum_exp) * self.num_losses
         
-        # Final NaN guard
         if torch.isnan(self.weights).any() or torch.isinf(self.weights).any():
             self.weights = torch.ones(self.num_losses).to(device)
+        
+        # Keep history bounded
+        if len(self.loss_history) > 100:
+            self.loss_history = self.loss_history[-50:]
         
         return self.weights
 
@@ -81,7 +82,6 @@ def train_and_evaluate(args):
 
     print(f"Device: {device}")
     
-    # Enable TF32 for better performance/stability on Ampere+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     
@@ -96,10 +96,18 @@ def train_and_evaluate(args):
     perf = PerformanceMonitor(log_dir=log_dir)
     mem = MemoryMonitor(device)
     
+    # ── Full loss weights from config (used after warmup) ──
+    full_weights = {
+        'l1': args.loss_weights[0],
+        'perceptual': args.loss_weights[1],
+        'ssim': args.loss_weights[2],
+        'edge': args.loss_weights[3] if len(args.loss_weights) > 3 else 0.1,
+        'freq': args.loss_weights[4] if len(args.loss_weights) > 4 else 0.3
+    }
+    
     # ── 2. Data ───────────────────────────────────────────────
     print(f"Preparing data from {args.data_path}...")
     
-    # ── Data Loading ──
     try:
         train_inp, train_target, val_inp, val_target = get_or_create_data_split(
             args.data_path, val_split=0.1, seed=args.seed
@@ -168,17 +176,8 @@ def train_and_evaluate(args):
     print(f"  Parameters: {total_params:,} total | {trainable_params:,} trainable")
 
     # ── 4. Loss & Optimizer ───────────────────────────────────
-    criterion = WaveSSMLoss(
-        weights={
-            'l1': args.loss_weights[0],
-            'perceptual': args.loss_weights[1],
-            'ssim': args.loss_weights[2],
-            'edge': args.loss_weights[3] if len(args.loss_weights) > 3 else 0.1,
-            'freq': args.loss_weights[4] if len(args.loss_weights) > 4 else 0.3
-        }
-    ).to(device)
+    criterion = WaveSSMLoss(weights=full_weights).to(device)
     
-    # ── 4. Optimization Setup ─────────────────────────────────
     # Split params: no weight decay for biases, norms, and scalars
     decay, no_decay = [], []
     for n, p in model.named_parameters():
@@ -194,7 +193,7 @@ def train_and_evaluate(args):
         lr=args.lr, weight_decay=1e-4
     )
     
-    warmup_iters = min(1000, args.num_iter // 30) # Warmup 1000 iters
+    warmup_iters = min(1000, args.num_iter // 30)
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_iters)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iter - warmup_iters, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_iters])
@@ -209,7 +208,6 @@ def train_and_evaluate(args):
     
     checkpoint_path = args.model_file
     if args.resume:
-        # Try explicit path first, then auto-find latest
         ckpt = checkpoint_path if os.path.exists(checkpoint_path) else find_latest_checkpoint(
             os.path.dirname(checkpoint_path)
         )
@@ -223,15 +221,11 @@ def train_and_evaluate(args):
             best_val_loss = meta['best_val_loss']
             loss_history = meta['loss_history']
             val_history = meta['val_history']
-            # Restore GradScaler state to avoid recalibration waste
             if meta.get('extra') and 'scaler_state_dict' in meta['extra']:
                 scaler.load_state_dict(meta['extra']['scaler_state_dict'])
-                # Safety Clamp: prevent extreme scaling from bad history
                 current_scale = scaler.get_scale()
                 if current_scale < 1.0 or current_scale > 1e10:
-                     print(f"  [WARN] Abnormal scale {current_scale} in checkpoint. Resetting to 4096.")
-                     # Accessing internal _scale for reset (safe on PyTorch < 2.4, verify for newer)
-                     # Or just re-init if problematic. Assuming standard structure:
+                     print(f"  [WARN] Abnormal scale {current_scale}. Resetting to 4096.")
                      scaler._scale = torch.tensor(4096.0).to(device)
             print(f"  Resumed at iter {start_iter} | Best PSNR: {best_psnr:.2f} | Best SSIM: {best_ssim_val:.4f}")
         else:
@@ -240,6 +234,7 @@ def train_and_evaluate(args):
     # ── 6. Training Loop ──────────────────────────────────────
     print(f"\nStarting training: iters {start_iter} -> {args.num_iter}")
     print(f"  Batch size: {args.batch_size} | LR: {args.lr}")
+    print(f"  Full loss weights: {full_weights}")
     print(f"  Logging to: {perf.csv_path}")
     print(f"  Visualizations: {vis_dir}")
     print()
@@ -247,7 +242,11 @@ def train_and_evaluate(args):
     model.train()
     iter_train_loader = iter(train_loader)
     metrics = MetricsTracker()
-    dwa_updater = DWALossUpdater(num_losses=5) # Initialize DWA
+    dwa_updater = DWALossUpdater(num_losses=5)
+    
+    # Track last valid batch for visualization
+    last_rain = None
+    last_norain = None
     
     pbar = tqdm(range(start_iter, args.num_iter), initial=start_iter, total=args.num_iter)
     
@@ -270,32 +269,28 @@ def train_and_evaluate(args):
                 print(f"[NaN INPUT] iter {n_iter} skipping batch")
                 continue
 
-            # Progressive Warmup Weights
+            # ── Progressive Loss Warmup ──
             if n_iter < 1000:
-                # First 1k iters: L1 only
                 criterion.update_weights({'l1': 1.0, 'perceptual': 0.0, 'ssim': 0.0, 'edge': 0.0, 'freq': 0.0})
-            elif n_iter < 5000:
-                # 1k-5k iters: Add mild perceptual/SSIM
+            elif n_iter < 3000:
                 criterion.update_weights({'l1': 1.0, 'perceptual': 0.1, 'ssim': 0.1, 'edge': 0.0, 'freq': 0.0})
-            else:
-                # 5k+: Restore full weights from config
+            elif n_iter < 5000:
+                # Ramp up gradually
+                t = (n_iter - 3000) / 2000.0  # 0 -> 1 over iter 3k-5k
                 criterion.update_weights({
-                    'l1': args.loss_weights[0],
-                    'perceptual': args.loss_weights[1],
-                    'ssim': args.loss_weights[2],
-                    'edge': args.loss_weights[3],
-                    'freq': args.loss_weights[4]
+                    'l1': full_weights['l1'],
+                    'perceptual': 0.1 + t * (full_weights['perceptual'] - 0.1),
+                    'ssim': 0.1 + t * (full_weights['ssim'] - 0.1),
+                    'edge': t * full_weights['edge'],
+                    'freq': t * full_weights['freq']
                 })
-
-            # DWA Update (every 10 iters, but DISABLED for first 5000 iters)
-            if n_iter > 5000 and n_iter % 10 == 0:
-                # ... DWA logic ...
-                pass 
+            else:
+                # ── FIX: restore full weights from config after warmup ──
+                criterion.update_weights(full_weights)
 
             optimizer.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda'):
-                # Forward
                 out = model(rain)
                 
                 # 2. Output Check
@@ -304,11 +299,9 @@ def train_and_evaluate(args):
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                # 3. Compute Loss
-                # Note: We assume criterion returns total_loss, loss_dict
                 loss, loss_dict = criterion(out, norain, return_dict=True)
                 
-                # 4. Strict Loss Check
+                # 3. Strict Loss Check
                 is_loss_finite = True
                 for k, v in loss_dict.items():
                     if not math.isfinite(v):
@@ -317,40 +310,58 @@ def train_and_evaluate(args):
                 if not is_loss_finite or not torch.isfinite(loss):
                      print(f"[NaN SUBLOSS] iter {n_iter}: sub-loss non-finite, skipping batch")
                      optimizer.zero_grad(set_to_none=True)
-                     scaler.update() # shrink scale just in case
+                     scaler.update()
                      continue
 
             # Backward with AMP scaling
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
 
-            # 5. Gradient Check
-            grad_valid = True
-            for p in model.parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    grad_valid = False
-                    break
+            # ── FIX: use clip_grad_norm_ return value instead of iterating all params ──
+            # The old code iterated every parameter checking for NaN grads,
+            # forcing a CPU-GPU sync every iteration. clip_grad_norm_ returns
+            # the total norm which we can check in one shot.
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             
-            if not grad_valid:
-                print(f"[NaN GRAD] iter {n_iter}: skipping step")
+            if not torch.isfinite(grad_norm):
+                print(f"[NaN GRAD] iter {n_iter}: grad_norm={grad_norm:.2f}, skipping step")
                 optimizer.zero_grad(set_to_none=True)
-                scaler.update() 
+                scaler.update()
                 continue
 
-            # Clip and Step
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             
             iter_time = perf.iter_end()
             
-            # Track (cap history at 5000 to prevent checkpoint bloat)
+            # Track (cap history at 5000)
             loss_val = loss.item()
             loss_history.append(loss_val)
             if len(loss_history) > 5000:
                 loss_history = loss_history[-5000:]
             metrics.update({'total_loss': loss_val, **loss_dict})
+            
+            # Save last valid batch for visualization
+            last_rain = rain.detach()
+            last_norain = norain.detach()
+            
+            # ── DWA update (every 50 iters after warmup) ──
+            if n_iter > 5000 and n_iter % 50 == 0:
+                dwa_losses = [
+                    loss_dict.get('l1', 0),
+                    loss_dict.get('perceptual', 0),
+                    loss_dict.get('ssim', 0),
+                    loss_dict.get('edge', 0),
+                    loss_dict.get('freq', 0)
+                ]
+                dwa_weights = dwa_updater.update(dwa_losses)
+                keys = ['l1', 'perceptual', 'ssim', 'edge', 'freq']
+                new_w = {}
+                for i, k in enumerate(keys):
+                    # Scale DWA weights relative to full_weights
+                    new_w[k] = full_weights[k] * dwa_weights[i].item()
+                criterion.update_weights(new_w)
             
             # ── Progress bar (every 10 iters) ──
             if n_iter % 10 == 0:
@@ -386,7 +397,6 @@ def train_and_evaluate(args):
                       f"PSNR: {val_result['psnr']:.2f} | SSIM: {val_result['ssim']:.4f} | "
                       f"{mem.summary()}")
                 
-                # Update best metrics FIRST (before saving checkpoint)
                 is_best = False
                 if val_result['psnr'] > best_psnr:
                     best_psnr = val_result['psnr']
@@ -401,7 +411,6 @@ def train_and_evaluate(args):
                 config_dict = {k: str(v) for k, v in vars(args).items()}
                 extra = {'scaler_state_dict': scaler.state_dict()}
                 
-                # Save latest checkpoint (with correct best metrics)
                 save_checkpoint(
                     filepath=checkpoint_path,
                     model=model, optimizer=optimizer, scheduler=scheduler,
@@ -410,7 +419,6 @@ def train_and_evaluate(args):
                     val_history=val_history, config=config_dict, extra=extra
                 )
                 
-                # Save best checkpoint
                 if is_best:
                     best_path = checkpoint_path.replace('.pth', '_best.pth')
                     save_checkpoint(
@@ -422,11 +430,10 @@ def train_and_evaluate(args):
                     )
                     print(f"  ★ New best! PSNR={best_psnr:.2f} SSIM={best_ssim_val:.4f}")
                 
-                model.train()  # Back to train mode
+                model.train()
             
             # ── Visualization (every 5000 iters) ──
             if n_iter > 0 and n_iter % 5000 == 0:
-                # Generate plots from CSV
                 try:
                     plot_training_curves(perf.csv_path, vis_dir, title=f'WaveSSM-X Training (iter {n_iter})')
                     if val_history:
@@ -434,23 +441,21 @@ def train_and_evaluate(args):
                 except Exception as e:
                     print(f"  [Viz warning] {e}")
                 
-                # Save sample grid
-                model.eval()
-                with torch.no_grad():
-                    sample_out = model(rain[:4])
-                save_sample_grid(
-                    rain[:4], sample_out, norain[:4],
-                    os.path.join(vis_dir, f'samples_iter{n_iter}.png'),
-                    title=f'Iteration {n_iter}'
-                )
-                model.train()
+                # ── FIX: use tracked last_rain/last_norain instead of loop variable ──
+                if last_rain is not None:
+                    model.eval()
+                    with torch.no_grad():
+                        sample_out = model(last_rain[:4])
+                    save_sample_grid(
+                        last_rain[:4], sample_out, last_norain[:4],
+                        os.path.join(vis_dir, f'samples_iter{n_iter}.png'),
+                        title=f'Iteration {n_iter}'
+                    )
+                    model.train()
                 
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print(f"\n[OOM] Iter {n_iter}: Clearing cache, skipping batch...")
-                if 'out' in dir(): del out
-                if 'rain' in dir(): del rain
-                if 'norain' in dir(): del norain
                 mem.safe_clear()
                 optimizer.zero_grad(set_to_none=True)
                 continue
@@ -469,7 +474,6 @@ def train_and_evaluate(args):
         val_history=val_history, config=config_dict
     )
     
-    # Final visualization
     try:
         plot_training_curves(perf.csv_path, vis_dir, title='WaveSSM-X Training (Final)')
         if val_history:
@@ -487,12 +491,7 @@ def train_and_evaluate(args):
 
 
 def validate(model, val_loader, criterion, device, max_samples=50):
-    """
-    Run validation and compute PSNR + SSIM metrics.
-    
-    Returns:
-        Dict with 'val_loss', 'psnr', 'ssim'
-    """
+    """Run validation and compute PSNR + SSIM metrics."""
     model.eval()
     total_loss = 0.0
     total_psnr = 0.0
@@ -511,12 +510,10 @@ def validate(model, val_loader, criterion, device, max_samples=50):
                 out = model(rain)
                 loss = criterion(out, norain)
             
-            # Clamp output for metric computation
             out_clamped = out.float().clamp(0, 1)
             norain_clamped = norain.float().clamp(0, 1)
             
             loss_val = loss.item()
-            # Skip NaN batches (check on CPU, no extra GPU sync)
             if math.isnan(loss_val) or math.isinf(loss_val):
                 continue
             
@@ -526,7 +523,7 @@ def validate(model, val_loader, criterion, device, max_samples=50):
             count += 1
     
     if count == 0:
-        print("  [WARN] Validation set is empty! Returning zeros.")
+        print("  [WARN] Validation produced 0 valid batches!")
     n = max(count, 1)
     return {
         'val_loss': total_loss / n,

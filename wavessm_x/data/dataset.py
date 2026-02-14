@@ -6,9 +6,7 @@ import os
 import glob
 import random
 import numpy as np
-import cv2
 from typing import Optional, List, Tuple
-from .augmentation import AdvancedAugmentation
 
 
 def pad_image_needed(img: torch.Tensor, size: Tuple[int, int]):
@@ -29,7 +27,7 @@ def rgb_to_y(x: torch.Tensor):
 
 class TrainDataset(Dataset):
     """
-    Enhanced training dataset with optimizations and advanced augmentation
+    Enhanced training dataset with optimizations.
     """
     def __init__(self, data_path: str, data_path_test: str, data_name: str, 
                  data_type: str, patch_size: Optional[int] = None, 
@@ -39,7 +37,6 @@ class TrainDataset(Dataset):
         self.data_name, self.data_path, self.patch_size = data_name, data_path, patch_size
         self.data_type = data_type
         
-        # Use provided file lists (from split) or discover them
         if inp_files and target_files:
              self.inp_files = inp_files
              self.target_files = target_files
@@ -49,15 +46,10 @@ class TrainDataset(Dataset):
         self._validate_image_pairs()
 
         self.sample_num = len(self.inp_files)
-        # Randomize initial sample count slightly to prevent epoch synchronization issues
         if length:
              self.sample_num = length
         
-        self.use_advanced_aug = use_advanced_aug
-        if use_advanced_aug:
-            self.augmentor = AdvancedAugmentation()
-            
-        # Cache for small datasets (under 1GB)
+        # Cache for small datasets (under 5000 images)
         self.use_cache = self.sample_num < 5000 
         self.image_cache = {}
 
@@ -67,7 +59,6 @@ class TrainDataset(Dataset):
         self.inp_files = []
         self.target_files = []
         
-        # Try 'inp' and 'input' folders
         inp_dirs = ['inp', 'input']
         target_dirs = ['target', 'gt', 'ground_truth']
         
@@ -99,7 +90,7 @@ class TrainDataset(Dataset):
         """Validate that corrupt and clear images are properly paired"""
         min_len = min(len(self.inp_files), len(self.target_files))
         if len(self.inp_files) != len(self.target_files):
-            print(f"Warning: Mismatched dataset implementation. Inp: {len(self.inp_files)}, Target: {len(self.target_files)}. Truncating to {min_len}.")
+            print(f"Warning: Mismatched dataset. Inp: {len(self.inp_files)}, Target: {len(self.target_files)}. Truncating to {min_len}.")
         
         self.inp_files = self.inp_files[:min_len]
         self.target_files = self.target_files[:min_len]
@@ -116,44 +107,31 @@ class TrainDataset(Dataset):
             return img
         except Exception as e:
             print(f"Error loading {image_path}: {e}")
-            # Return a blank image as fallback to prevent crashing
             return Image.new('RGB', (256, 256))
 
     def _apply_optimized_augmentation(self, corrupt: torch.Tensor, clear: torch.Tensor):
-        """Apply optimized augmentation that maintains input-target consistency"""
+        """Apply augmentation that maintains input-target consistency.
+        
+        FIX: Removed T.rotate and T.affine - these use bilinear interpolation
+        which fills borders with zeros, creating artificial "corruption" regions
+        that don't match the target and poison the training signal.
+        Only lossless geometric transforms are safe for paired data.
+        """
         # Random 90-degree rotation (lossless, no interpolation artifacts)
-        # Critical for directional invariance of corruption patterns
         if random.random() < 0.5:
-            k = random.choice([1, 2, 3])  # 90°, 180°, 270°
+            k = random.choice([1, 2, 3])
             corrupt = torch.rot90(corrupt, k, dims=[1, 2])
             clear = torch.rot90(clear, k, dims=[1, 2])
 
-        # Random horizontal flip (applied to both)
+        # Random horizontal flip
         if random.random() < 0.5:
             corrupt = T.hflip(corrupt)
             clear = T.hflip(clear)
 
-        # Random vertical flip (applied to both)
+        # Random vertical flip
         if random.random() < 0.5:
             corrupt = T.vflip(corrupt)
             clear = T.vflip(clear)
-
-        # Random Rotation (+/- 10 deg) - mild to preserve content
-        if random.random() < 0.3:
-            angle = random.uniform(-10, 10)
-            corrupt = T.rotate(corrupt, angle)
-            clear = T.rotate(clear, angle)
-            
-        # Random Affine (Scale & Shear) - effectively handles perspective shifts
-        if random.random() < 0.3:
-            scale = random.uniform(0.9, 1.1)
-            shear = random.uniform(-10, 10)
-            corrupt = T.affine(corrupt, angle=0, translate=(0,0), scale=scale, shear=shear)
-            clear = T.affine(clear, angle=0, translate=(0,0), scale=scale, shear=shear)
-
-        # NOTE: Color jitter deliberately NOT applied — it shifts input colors
-        # without matching the target, creating a conflicting training signal.
-        # Gaussian noise also skipped to avoid corrupting clean signal learning.
 
         return corrupt, clear
 
@@ -170,19 +148,20 @@ class TrainDataset(Dataset):
             w, h = corrupt_img.size
 
             if self.patch_size:
-                # Optimized random crop
                 if w < self.patch_size or h < self.patch_size:
                      corrupt = T.to_tensor(corrupt_img)
                      clear = T.to_tensor(clear_img)
                      corrupt = pad_image_needed(corrupt, (self.patch_size, self.patch_size))
                      clear = pad_image_needed(clear, (self.patch_size, self.patch_size))
                      
-                     # Extract patch after padding
-                     i, j, h, w = T.RandomCrop.get_params(corrupt, output_size=(self.patch_size, self.patch_size))
-                     corrupt = T.crop(corrupt, i, j, h, w)
-                     clear = T.crop(clear, i, j, h, w)
+                     # ── FIX: manual random crop instead of T.RandomCrop.get_params ──
+                     # T is torchvision.transforms.functional which has no RandomCrop class
+                     _, ph, pw = corrupt.shape
+                     i = random.randint(0, ph - self.patch_size)
+                     j = random.randint(0, pw - self.patch_size)
+                     corrupt = T.crop(corrupt, i, j, self.patch_size, self.patch_size)
+                     clear = T.crop(clear, i, j, self.patch_size, self.patch_size)
                 else:
-                     # Direct crop from PIL for speed
                      i = random.randint(0, h - self.patch_size)
                      j = random.randint(0, w - self.patch_size)
                      corrupt_patch = corrupt_img.crop((j, i, j + self.patch_size, i + self.patch_size))
@@ -196,7 +175,6 @@ class TrainDataset(Dataset):
             corrupt, clear = self._apply_optimized_augmentation(corrupt, clear)
             
             train_name = os.path.basename(self.inp_files[idx])
-            # Return actual tensor dimensions, not image dimensions
             h, w = corrupt.shape[1], corrupt.shape[2]
             
             return corrupt, clear, train_name, h, w
@@ -213,9 +191,8 @@ class TestDataset(Dataset):
     def __init__(self, data_path, data_path_test, task_name, data_type, length=None, resolution=None):
         super().__init__()
         self.task_name, self.data_type = task_name, data_type
-        self.resolution = resolution  # None = original resolution
+        self.resolution = resolution
 
-        # Support ./input/ and ./inp/
         p_inp = os.path.join(data_path_test, 'input')
         if not os.path.exists(p_inp):
              p_inp = os.path.join(data_path_test, 'inp')

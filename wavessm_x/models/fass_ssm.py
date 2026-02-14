@@ -94,12 +94,12 @@ class FrequencyAdaptiveSSM(nn.Module):
     """
     Frequency-Adaptive State Space Model (FASS).
 
-    Core innovation: Wavelet coefficients CONTROL SSM parameters (B, C, Δ),
+    Core innovation: Wavelet coefficients CONTROL SSM parameters (B, C, Delta),
     not just preprocess the input.
 
     - B (input matrix): Modulated by LL (structure preservation)
     - C (output matrix): Modulated by HH (texture reconstruction)
-    - Δ (timestep): Modulated by edge energy LH+HL (adaptive dynamics)
+    - Delta (timestep): Modulated by edge energy LH+HL (adaptive dynamics)
 
     Includes:
     - True parallel scan (O(N) complexity)
@@ -188,8 +188,8 @@ class FrequencyAdaptiveSSM(nn.Module):
 
     def _init_weights(self):
         for name, param in self.named_parameters():
-            # Skip DWT buffers/params if present, they are fixed
-            if 'dwt' in name:
+            # Skip DWT buffers, A_log (HiPPO-style init), D, skip_scale, and modulation scalars
+            if any(skip in name for skip in ('dwt', 'A_log', 'D', 'skip_scale', 'alpha', 'beta', 'gamma')):
                 continue
                 
             if 'weight' in name and param.dim() >= 2:
@@ -306,27 +306,21 @@ class FrequencyAdaptiveSSM(nn.Module):
         A = -torch.exp(self.A_log.float())
 
         if HAS_MAMBA_CUDA:
-            # Fused CUDA kernel — same math, 10-50x faster
-            u = x_conv.transpose(1, 2).contiguous()          # (B, d_inner, L)
-            input_dtype = u.dtype
-            
-            # P0 Fix: Force float32 inputs for selective_scan kernel to prevent overflow
-            # The kernel internal accumulation is safer when inputs are float32
-            u_f = u.float()
-            dt_f = dt.float()
-            delta_f = dt_f.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous()
-            B_f = B.transpose(1, 2).contiguous().float()
-            C_f = C.transpose(1, 2).contiguous().float()
-            z_f = z.transpose(1, 2).contiguous().float()
+            # ── FIX: ALL inputs to selective_scan in float32 ──
+            # float16 accumulations over L=65536 tokens overflow and produce NaN.
+            u = x_conv.transpose(1, 2).contiguous().float()
+            delta = dt.unsqueeze(1).expand(-1, self.d_inner, -1).contiguous().float()
+            B_ssm = B.transpose(1, 2).contiguous().float()
+            C_ssm = C.transpose(1, 2).contiguous().float()
+            z_ssm = z.transpose(1, 2).contiguous().float()
 
-            # A is already float32 from log conversion
             y = selective_scan_fn(
-                u_f, delta_f, A, B_f, C_f,
-                D=self.D.float(), z=z_f, delta_softplus=False
+                u, delta, A, B_ssm, C_ssm,
+                D=self.D.float(), z=z_ssm, delta_softplus=False
             )
-            y = y.to(input_dtype).transpose(1, 2)  # Cast back and transpose
-            # Unconditional NaN/Inf guard — runs on GPU, no sync overhead
-            y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
+            y = y.transpose(1, 2)  # (B, L, d_inner)
+            # Cast back to model dtype after scan
+            y = y.to(x.dtype)
         else:
             # Fallback: pure PyTorch parallel scan
             dt_expand = dt.unsqueeze(-1).unsqueeze(-1)
@@ -377,7 +371,6 @@ class DualStreamFASS(nn.Module):
         self.idwt = DWTInverse(mode='zero', wave=wavelet)
 
         # No freq modulation internally because we already feed specific bands
-        # structure/texture SSMS capture long-range dependencies in their respective domains
         self.struct_ssm = FrequencyAdaptiveSSM(
             d_model=channels,
             d_state=struct_state,
@@ -401,16 +394,9 @@ class DualStreamFASS(nn.Module):
         self.cross_attn = CrossFrequencyAttention(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input (B, C, H, W)
-        Returns:
-            Output (B, C, H, W)
-        """
         B, C, H, W = x.shape
         input_dtype = x.dtype
 
-        # DWT does not support float16 — force float32 under AMP
         with torch.amp.autocast('cuda', enabled=False):
             yl, yh = self.dwt(x.float())
             yh_coeffs = yh[0]
@@ -418,7 +404,6 @@ class DualStreamFASS(nn.Module):
             hl = yh_coeffs[:, :, 1, :, :]
             hh = yh_coeffs[:, :, 2, :, :]
 
-        # Use ACTUAL DWT output dims (not H//2) because DWT padding can differ
         h_half, w_half = yl.shape[2], yl.shape[3]
 
         yl_seq = yl.flatten(2).transpose(1, 2)
@@ -434,15 +419,12 @@ class DualStreamFASS(nn.Module):
         yl_refined = self.cross_attn(yl_out, (lh_out, hl_out, hh_out))
 
         yh_out = torch.stack([lh_out, hl_out, hh_out], dim=2)
-        # IDWT also requires float32
         with torch.amp.autocast('cuda', enabled=False):
             out = self.idwt((yl_refined.float(), [yh_out.float()]))
 
-        # Robustly handle DWT padding mismatches
         if out.shape[-2:] != (H, W):
             out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
 
-        # Match input dtype
         return out.to(input_dtype)
 
 
@@ -460,42 +442,25 @@ class CrossFrequencyAttention(nn.Module):
         self.scale = channels ** -0.5
 
     def forward(self, ll_features: torch.Tensor, hf_tuple: tuple) -> torch.Tensor:
-        """
-        Args:
-            ll_features: (B, C, H, W)
-            hf_tuple: (LH, HL, HH) each (B, C, H, W)
-        Returns:
-            Refined LL features (B, C, H, W)
-        """
         lh, hl, hh = hf_tuple
         hf_features = torch.cat([lh, hl, hh], dim=1)
 
         B, C, H, W = ll_features.shape
 
-        # Use view to flatten H, W but keep C
-        q = self.query(ll_features).view(B, C, -1)      # (B, C, HW)
-        k = self.key(hf_features).view(B, C, -1)        # (B, C, HW)
-        v = self.value(hf_features).view(B, C, -1)      # (B, C, HW)
+        q = self.query(ll_features).view(B, C, -1)
+        k = self.key(hf_features).view(B, C, -1)
+        v = self.value(hf_features).view(B, C, -1)
 
-        # Calculates attention map of size (B, C, C) - Efficient O(C^2)
-        # Instead of (B, HW, HW) - Expensive O(N^2)
         # FP32 Attention for stability
         q_f, k_f = q.float(), k.float()
         scores = torch.matmul(q_f, k_f.transpose(-1, -2)) * self.scale
-        
-        # Max-subtraction for numerical stability
         scores = scores - scores.max(dim=-1, keepdim=True)[0]
         
         attn = torch.softmax(scores, dim=-1)
-        
-        # Guard against degenerate rows
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
         attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
-        
-        # Cast back to model dtype
         attn = attn.type_as(v)
         
-        # Apply attention to values
         out = (attn @ v).view(B, C, H, W)
 
         return ll_features + out

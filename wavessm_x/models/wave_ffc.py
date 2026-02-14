@@ -9,6 +9,9 @@ class SpectralTransform(nn.Module):
     """
     FFT-based global convolution from LaMa.
     Processes features in the frequency domain for image-wide receptive field.
+    
+    FIX: Entire pipeline stays float32. Casting FFT output to float16 for
+    conv/bn/relu causes overflow at DC/low-frequency components.
     """
 
     def __init__(self, in_channels: int, out_channels: int):
@@ -21,19 +24,14 @@ class SpectralTransform(nn.Module):
         B, C, H, W = x.shape
         orig_dtype = x.dtype
 
-        # Force FP32 for entire FFT-Conv-IFFT block stability
-        # FFT coefficients (especially DC/Low-Freq) can exceed FP16 limits
-        with torch.cuda.amp.autocast(enabled=False):
+        # ── FIX: entire block in float32, cast back only at the end ──
+        with torch.amp.autocast('cuda', enabled=False):
             x_f = x.float()
             x_fft = torch.fft.rfft2(x_f, norm='ortho')
             x_fft = torch.cat([x_fft.real, x_fft.imag], dim=1)
 
-            # Conv-BN-ReLU stays in FP32
-            x_fft = self.conv(x_fft)
-            x_fft = self.bn(x_fft)
-            x_fft = self.relu(x_fft)
+            x_fft = self.relu(self.bn(self.conv(x_fft)))
 
-            # IFFT also in FP32
             real, imag = x_fft.chunk(2, dim=1)
             x_fft_complex = torch.complex(real, imag)
             x = torch.fft.irfft2(x_fft_complex, s=(H, W), norm='ortho')
@@ -49,8 +47,6 @@ class WaveFFC(nn.Module):
     - Local path: Standard convolution for local features
     - Global path: FFT-based convolution for image-wide context
     - Wavelet guidance: DWT-based gating for frequency-aware fusion
-
-    This is inspired by LaMa's FFC but adds wavelet-based modulation.
     """
 
     def __init__(self, channels: int, ratio: float = 0.5, wavelet: str = 'db3'):
@@ -87,11 +83,10 @@ class WaveFFC(nn.Module):
         global_out = self.global_conv(global_x)
 
         try:
-            # DWT does not support float16 — force float32 under AMP
             with torch.amp.autocast('cuda', enabled=False):
                 LL, _ = self.dwt(x.float())
             gate = self.freq_gate(F.interpolate(LL, size=x.shape[-2:], mode='bilinear', align_corners=False))
-            gate = gate.to(x.dtype)  # Match input dtype
+            gate = gate.to(x.dtype)
         except RuntimeError:
             gate = torch.ones(x.shape, device=x.device, dtype=x.dtype) * 0.5
 

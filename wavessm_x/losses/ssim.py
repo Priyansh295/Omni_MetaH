@@ -16,9 +16,15 @@ def create_window(window_size, channel, sigma=1.5):
 
 
 def ssim(img1, img2, window_size=11, sigma=1.5, size_average=True, window=None):
+    # ── FIX: force float32 ──
+    # img1*img1 squared then summed over 11x11 window overflows float16
+    img1 = img1.float()
+    img2 = img2.float()
+    
     channel = img1.size(1)
     if window is None:
-        window = create_window(window_size, channel, sigma).to(img1.device).type(img1.dtype)
+        window = create_window(window_size, channel, sigma).to(img1.device)
+    window = window.float()
 
     mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
@@ -31,20 +37,16 @@ def ssim(img1, img2, window_size=11, sigma=1.5, size_average=True, window=None):
     sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
     sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
 
-    # Clamp to prevent negative variance from numerical precision
     sigma1_sq = sigma1_sq.clamp(min=0)
     sigma2_sq = sigma2_sq.clamp(min=0)
 
     C1 = 0.01**2
     C2 = 0.03**2
-    eps = 1e-4  # float16-safe epsilon
 
     numerator = (2*mu1_mu2 + C1) * (2*sigma12 + C2)
     denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    ssim_map = numerator / (denominator + eps)
+    ssim_map = numerator / denominator
     
-    # Final guard against NaN/Inf
-    ssim_map = torch.nan_to_num(ssim_map, nan=0.0, posinf=1.0, neginf=0.0)
     ssim_map = ssim_map.clamp(0, 1)
 
     if size_average:
@@ -62,14 +64,9 @@ class SSIMLoss(torch.nn.Module):
         self._cached_channels = 0
 
     def forward(self, img1, img2):
-        # P1 Fix: SSIM calculation must be float32 to prevent precision loss
-        img1 = img1.float()
-        img2 = img2.float()
-        
         channel = img1.size(1)
         if self._cached_window is None or self._cached_channels != channel:
             self._cached_window = create_window(self.window_size, channel, self.sigma)
             self._cached_channels = channel
-        # Ensure window is float32
         window = self._cached_window.to(img1.device).float()
         return 1 - ssim(img1, img2, self.window_size, self.sigma, window=window)
