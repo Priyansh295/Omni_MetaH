@@ -173,6 +173,25 @@ class StyleLoss(nn.Module):
         return loss
 
 
+class HighReceptiveFieldPerceptualLoss(nn.Module):
+    """
+    High Receptive Field Perceptual Loss (LaMa style).
+    Uses deeper layers of VGG19 (relu5_4) to capture global structure.
+    
+    CRITICAL: Entire computation in FP32 to prevent overflow.
+    """
+    def __init__(self):
+        super().__init__()
+        # Reuse PerceptualLoss logic but with specific layers/weights
+        self.impl = PerceptualLoss(
+            layers=['relu1_2', 'relu2_2', 'relu3_2', 'relu4_2', 'relu5_2'],
+            weights=[1.0/32, 1.0/16, 1.0/8, 1.0/4, 1.0]
+        )
+            
+    def forward(self, pred, target):
+        return self.impl(pred, target)
+
+
 # ═══════════════════════════════════════════════════════════
 # Simpler alternative: Use LPIPS if available
 # ═══════════════════════════════════════════════════════════
