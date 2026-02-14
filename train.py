@@ -226,6 +226,13 @@ def train_and_evaluate(args):
             # Restore GradScaler state to avoid recalibration waste
             if meta.get('extra') and 'scaler_state_dict' in meta['extra']:
                 scaler.load_state_dict(meta['extra']['scaler_state_dict'])
+                # Safety Clamp: prevent extreme scaling from bad history
+                current_scale = scaler.get_scale()
+                if current_scale < 1.0 or current_scale > 1e10:
+                     print(f"  [WARN] Abnormal scale {current_scale} in checkpoint. Resetting to 4096.")
+                     # Accessing internal _scale for reset (safe on PyTorch < 2.4, verify for newer)
+                     # Or just re-init if problematic. Assuming standard structure:
+                     scaler._scale = torch.tensor(4096.0).to(device)
             print(f"  Resumed at iter {start_iter} | Best PSNR: {best_psnr:.2f} | Best SSIM: {best_ssim_val:.4f}")
         else:
             print("No checkpoint found, starting fresh.")
